@@ -3,6 +3,8 @@
  * semantics cannot drift across app surfaces. */
 import { describe, expect, it } from 'vitest'
 import {
+  agentTabActionId,
+  getKeybindingDefinition,
   findKeybindingConflicts,
   formatKeybindingList,
   getEffectiveKeybindingsForAction,
@@ -14,6 +16,7 @@ import {
   normalizeKeybindingListForAction,
   normalizeKeybindingList
 } from './keybindings'
+import { ALL_TUI_AGENTS } from './tui-agent-display-names'
 
 describe('keybindings', () => {
   it('normalizes editable shortcut input and rejects unsafe bindings', () => {
@@ -242,6 +245,40 @@ describe('keybindings', () => {
     expect(
       keybindingMatchesAction('workspace.delete', binding, 'linux', {
         'workspace.delete': ['Mod+Shift+Backspace']
+      })
+    ).toBe(true)
+  })
+
+  it('defines a macOS-only default for the new agent tab shortcut', () => {
+    expect(getEffectiveKeybindingsForAction('tab.newAgent', 'darwin')).toEqual(['Mod+Alt+T'])
+    expect(getEffectiveKeybindingsForAction('tab.newAgent', 'linux')).toEqual([])
+    expect(getEffectiveKeybindingsForAction('tab.newAgent', 'win32')).toEqual([])
+    expect(
+      keybindingMatchesAction(
+        'tab.newAgent',
+        { key: 't', code: 'KeyT', meta: true, control: false, alt: true, shift: false },
+        'darwin'
+      )
+    ).toBe(true)
+  })
+
+  it('defines an unassigned per-agent tab action for every TUI agent', () => {
+    for (const agent of ALL_TUI_AGENTS) {
+      const actionId = agentTabActionId(agent)
+      const definition = getKeybindingDefinition(actionId)
+      expect(definition, actionId).toBeDefined()
+      expect(definition?.group).toBe('Agents')
+      expect(definition?.scope).toBe('tabs')
+      expect(getEffectiveKeybindingsForAction(actionId, 'darwin')).toEqual([])
+    }
+  })
+
+  it('matches per-agent tab actions only through user overrides', () => {
+    const binding = { key: 'k', code: 'KeyK', meta: true, control: false, alt: true, shift: true }
+    expect(keybindingMatchesAction(agentTabActionId('claude'), binding, 'darwin')).toBe(false)
+    expect(
+      keybindingMatchesAction(agentTabActionId('claude'), binding, 'darwin', {
+        'tab.newAgent.claude': ['Mod+Alt+Shift+K']
       })
     ).toBe(true)
   })
