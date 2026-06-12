@@ -81,6 +81,12 @@ describe('keybindings', () => {
         'darwin'
       )
     ).toEqual({ ok: false, error: 'Press a key, not only a modifier.' })
+    expect(
+      keybindingFromInput(
+        { key: '¡', code: 'Digit1', meta: true, control: false, alt: true, shift: false },
+        'darwin'
+      )
+    ).toEqual({ ok: false, error: 'Press a key, not only a modifier.' })
   })
 
   it('applies per-action bare-key rules while capturing shortcuts', () => {

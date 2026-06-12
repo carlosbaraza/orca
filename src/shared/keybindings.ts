@@ -1219,10 +1219,20 @@ function shouldUseMacOptionComposedCaptureFallback(
 ): boolean {
   // Why: macOS Option+key reports composed characters (Option+C -> ç), so
   // capturing Alt shortcuts needs the same physical-code fallback as matching.
+  if (
+    getKeybindingPlatform(platform) !== 'darwin' ||
+    !hasModifier(input, 'alt') ||
+    MODIFIER_KEYS.has(input.key ?? '')
+  ) {
+    return false
+  }
+  const physicalToken = physicalCodeKeyTokenFromInput(input)
+  if (!physicalToken) {
+    return false
+  }
   return (
-    getKeybindingPlatform(platform) === 'darwin' &&
-    hasModifier(input, 'alt') &&
-    !MODIFIER_KEYS.has(input.key ?? '')
+    (physicalToken.length === 1 && physicalToken >= 'A' && physicalToken <= 'Z') ||
+    isPunctuationKeyToken(physicalToken)
   )
 }
 
