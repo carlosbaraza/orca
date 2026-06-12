@@ -1209,7 +1209,20 @@ function numpadCodeKeyTokenFromInput(input: KeybindingInput): string | null {
   return code === 'NumpadAdd' || code === 'NumpadSubtract' ? normalizeKeyToken(code) : null
 }
 
-function keyTokenFromInput(input: KeybindingInput): string | null {
+function shouldUseMacOptionComposedCaptureFallback(
+  input: KeybindingInput,
+  platform: NodeJS.Platform
+): boolean {
+  // Why: macOS Option+key reports composed characters (Option+C -> ç), so
+  // capturing Alt shortcuts needs the same physical-code fallback as matching.
+  return (
+    getKeybindingPlatform(platform) === 'darwin' &&
+    hasModifier(input, 'alt') &&
+    !MODIFIER_KEYS.has(input.key ?? '')
+  )
+}
+
+function keyTokenFromInput(input: KeybindingInput, platform: NodeJS.Platform): string | null {
   const numpadKey = numpadCodeKeyTokenFromInput(input)
   if (numpadKey) {
     return numpadKey
@@ -1218,7 +1231,10 @@ function keyTokenFromInput(input: KeybindingInput): string | null {
   if (logicalKey) {
     return logicalKey
   }
-  if (!canUsePhysicalCodeFallback(input)) {
+  if (
+    !canUsePhysicalCodeFallback(input) &&
+    !shouldUseMacOptionComposedCaptureFallback(input, platform)
+  ) {
     return null
   }
   return physicalCodeKeyTokenFromInput(input)
@@ -1229,7 +1245,7 @@ function keybindingFromInputWithOptions(
   platform: NodeJS.Platform,
   options: NormalizeKeybindingOptions = {}
 ): KeybindingValidationResult {
-  const key = keyTokenFromInput(input)
+  const key = keyTokenFromInput(input, platform)
   if (!key) {
     return { ok: false, error: 'Press a key, not only a modifier.' }
   }

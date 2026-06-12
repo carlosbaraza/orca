@@ -62,6 +62,27 @@ describe('keybindings', () => {
     ).toEqual({ ok: false, error: 'Press a key, not only a modifier.' })
   })
 
+  it('captures macOS Option-composed key events via the physical code', () => {
+    expect(
+      keybindingFromInput(
+        { key: 'ç', code: 'KeyC', meta: true, control: false, alt: true, shift: false },
+        'darwin'
+      )
+    ).toEqual({ ok: true, value: 'Mod+Alt+C' })
+    expect(
+      keybindingFromInput(
+        { key: '“', code: 'BracketLeft', meta: true, control: false, alt: true, shift: false },
+        'darwin'
+      )
+    ).toEqual({ ok: true, value: 'Mod+Alt+BracketLeft' })
+    expect(
+      keybindingFromInput(
+        { key: 'Alt', code: 'AltLeft', meta: false, control: false, alt: true, shift: false },
+        'darwin'
+      )
+    ).toEqual({ ok: false, error: 'Press a key, not only a modifier.' })
+  })
+
   it('applies per-action bare-key rules while capturing shortcuts', () => {
     const deleteEvent = {
       key: 'Delete',
