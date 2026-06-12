@@ -304,6 +304,19 @@ describe('keybindings', () => {
     ).toBe(true)
   })
 
+  it('ignores selected actions when checking shortcut conflicts', () => {
+    expect(
+      findKeybindingConflicts(
+        'darwin',
+        {
+          'tab.newAgent.claude': ['Mod+Alt+Shift+K'],
+          'tab.newAgent.codex': ['Mod+Alt+Shift+K']
+        },
+        { ignoredActionIds: [agentTabActionId('claude')] }
+      )
+    ).toEqual([])
+  })
+
   it('reports customized renderer conflicts with native menu accelerators', () => {
     expect(findKeybindingConflicts('darwin')).toEqual([])
 

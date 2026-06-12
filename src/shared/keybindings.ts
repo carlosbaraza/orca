@@ -168,6 +168,10 @@ export type KeybindingConflict = {
   actionIds: KeybindingActionId[]
 }
 
+export type FindKeybindingConflictOptions = {
+  ignoredActionIds?: Iterable<KeybindingActionId>
+}
+
 export const KEYBINDING_DEFINITIONS: readonly KeybindingDefinition[] = [
   {
     id: 'worktree.quickOpen',
@@ -1620,15 +1624,21 @@ function formatKeyToken(token: string): string {
 
 export function findKeybindingConflicts(
   platform: NodeJS.Platform,
-  overrides?: KeybindingOverrides
+  overrides?: KeybindingOverrides,
+  options: FindKeybindingConflictOptions = {}
 ): KeybindingConflict[] {
   const owners = new Map<string, KeybindingActionId[]>()
+  const ignoredActionIds = new Set(options.ignoredActionIds ?? [])
   const customizedActions = new Set(
-    Object.keys(overrides ?? {}).filter((actionId): actionId is KeybindingActionId =>
-      isKeybindingActionId(actionId)
+    Object.keys(overrides ?? {}).filter(
+      (actionId): actionId is KeybindingActionId =>
+        isKeybindingActionId(actionId) && !ignoredActionIds.has(actionId)
     )
   )
   for (const definition of KEYBINDING_DEFINITIONS) {
+    if (ignoredActionIds.has(definition.id)) {
+      continue
+    }
     for (const binding of getEffectiveKeybindingsForAction(definition.id, platform, overrides)) {
       const groups = new Set([definition.conflictGroup ?? definition.scope])
       if (definition.conflictGroup) {

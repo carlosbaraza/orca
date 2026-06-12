@@ -15,7 +15,11 @@ import {
   type KeybindingOverrides,
   type TerminalShortcutPolicy
 } from '../../../../shared/keybindings'
-import { EMPTY_DISABLED_TUI_AGENTS, groupDefinitions } from './shortcut-groups'
+import {
+  EMPTY_DISABLED_TUI_AGENTS,
+  disabledAgentTabActionIds,
+  groupDefinitions
+} from './shortcut-groups'
 import { useAppStore } from '../../store'
 import { KeybindingsFileActions } from './KeybindingsFileActions'
 import { SettingsSubsectionHeader } from './SettingsFormControls'
@@ -141,9 +145,15 @@ export function ShortcutsPane(): React.JSX.Element {
   const [shortcutFilter, setShortcutFilter] = useState<ShortcutFilter>('all')
 
   const groups = useMemo(() => groupDefinitions(disabledTuiAgents), [disabledTuiAgents])
+  const ignoredConflictActionIds = useMemo(
+    () => disabledAgentTabActionIds(disabledTuiAgents),
+    [disabledTuiAgents]
+  )
   const conflictByAction = useMemo(() => {
     const result = new Map<KeybindingActionId, string[]>()
-    for (const conflict of findKeybindingConflicts(platform, keybindings)) {
+    for (const conflict of findKeybindingConflicts(platform, keybindings, {
+      ignoredActionIds: ignoredConflictActionIds
+    })) {
       const labels = conflict.actionIds
         .map((id) => getKeybindingDefinition(id)?.title ?? id)
         .join(', ')
@@ -155,7 +165,7 @@ export function ShortcutsPane(): React.JSX.Element {
       }
     }
     return result
-  }, [keybindings])
+  }, [ignoredConflictActionIds, keybindings])
   const shortcutGroups = useMemo<ShortcutRowsByGroup[]>(
     () =>
       groups.map((group) => ({
@@ -228,9 +238,9 @@ export function ShortcutsPane(): React.JSX.Element {
       (normalizedResult.length === 0 && defaults.length === 0)
         ? removeBindingOverride(keybindings, actionId)
         : { ...keybindings, [actionId]: normalizedResult }
-    const blockingConflict = findKeybindingConflicts(platform, next).find((conflict) =>
-      conflict.actionIds.includes(actionId)
-    )
+    const blockingConflict = findKeybindingConflicts(platform, next, {
+      ignoredActionIds: ignoredConflictActionIds
+    }).find((conflict) => conflict.actionIds.includes(actionId))
     if (blockingConflict) {
       const labels = blockingConflict.actionIds
         .filter((id) => id !== actionId)
