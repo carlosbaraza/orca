@@ -256,7 +256,8 @@ function planModelDiscovery(
       binary: command.binary,
       args: [...command.prefixArgs, ...modelDiscovery.args],
       stdinPayload: null,
-      label: spec.label
+      label: spec.label,
+      ...(Object.keys(command.env).length ? { env: command.env } : {})
     }
   }
 }
@@ -277,13 +278,17 @@ export async function discoverCommitMessageModelsLocal(
 
   return new Promise((resolve) => {
     let child: ChildProcess
-    const spawnEnv = env ?? process.env
     try {
       const planned = planModelDiscovery(spec, agentCommandOverride)
       if (!planned.ok) {
         resolve({ success: false, error: planned.error })
         return
       }
+      // Why: merge env-assignment prefixes from the override so model discovery
+      // runs the real binary with the same environment as generation.
+      const spawnEnv = planned.plan.env
+        ? { ...(env ?? process.env), ...planned.plan.env }
+        : (env ?? process.env)
       const resolvedBinary =
         process.platform === 'win32'
           ? resolveCliCommand(planned.plan.binary, {
@@ -487,7 +492,9 @@ async function runLocalPlan(
   return new Promise((resolve) => {
     let child: ChildProcess
     try {
-      const spawnEnv = env ?? process.env
+      // Why: `plan.env` carries leading `VAR=value` assignments from the agent
+      // command override; merge them over the base env so they reach the CLI.
+      const spawnEnv = plan.env ? { ...(env ?? process.env), ...plan.env } : (env ?? process.env)
       const resolvedBinary =
         process.platform === 'win32'
           ? resolveCliCommand(binary, { pathEnv: spawnEnv.PATH ?? spawnEnv.Path ?? null })
