@@ -4730,7 +4730,13 @@
           "31fd7150cf": "アップデートをチェックしています...",
           "3394d1f663": "チェック中",
           "d69a09b672": "アップデートは起動時に自動的にチェックされます。",
-          "7173352632": "idle"
+          "7173352632": "idle",
+          "coolingStatus": "Version {{value0}} is available but held by the update cooldown.",
+          "coolingSettingTitle": "Update cooldown",
+          "coolingSettingDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 disables the delay. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable.",
+          "coolingSettingLabel": "Update cooldown",
+          "coolingSettingSuffix": "days",
+          "coolingSettingControlDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 installs immediately. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable."
         },
         "GeneralWorkspaceSettingsSection": {
           "3d538a98f7": "ワークスペースの「開く」メニューから利用可能なアプリを選択します。",
@@ -6860,7 +6866,9 @@
             "7887a2c262": "フォルダ",
             "7baf524b04": "ワークスペース",
             "d0bc793689": "ワークスペースフォルダーが作成されるルートディレクトリ。",
-            "4c95d08fa2": "ワークスペースディレクトリ"
+            "4c95d08fa2": "ワークスペースディレクトリ",
+            "coolingSettingTitle": "Update cooldown",
+            "coolingSettingDescription": "Hold new releases for a number of days before installing them, as a supply-chain safeguard."
           }
         },
         "git": {

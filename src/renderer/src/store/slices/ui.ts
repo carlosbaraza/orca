@@ -861,6 +861,10 @@ export type UISlice = {
   setUpdateCardCollapsed: (collapsed: boolean) => void
   updateReassuranceSeen: boolean
   markUpdateReassuranceSeen: () => void
+  /** Days a newly observed update is held before it can auto-install
+   *  (supply-chain release aging). 0 disables the cooldown. */
+  updateCooldownDays: number
+  setUpdateCooldownDays: (days: number) => void
   isFullScreen: boolean
   setIsFullScreen: (v: boolean) => void
   /** URL opened when a new browser tab is created. Null = blank tab (default). */
@@ -2190,6 +2194,10 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         })(),
         dismissedUpdateVersion: ui.dismissedUpdateVersion ?? null,
         updateReassuranceSeen: ui.updateReassuranceSeen ?? false,
+        updateCooldownDays:
+          typeof ui.updateCooldownDays === 'number' && ui.updateCooldownDays > 0
+            ? ui.updateCooldownDays
+            : 0,
         browserDefaultUrl: ui.browserDefaultUrl ?? null,
         browserDefaultSearchEngine: ui.browserDefaultSearchEngine ?? null,
         browserDefaultZoomLevel: normalizeBrowserPageZoomLevel(ui.browserDefaultZoomLevel),
@@ -2309,6 +2317,13 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   markUpdateReassuranceSeen: () => {
     void window.api.ui.set({ updateReassuranceSeen: true }).catch(console.error)
     set({ updateReassuranceSeen: true })
+  },
+  updateCooldownDays: 0,
+  setUpdateCooldownDays: (days) => {
+    // Why: clamp to a non-negative integer; 0 disables the cooldown entirely.
+    const normalized = Number.isFinite(days) && days > 0 ? Math.floor(days) : 0
+    void window.api.ui.set({ updateCooldownDays: normalized }).catch(console.error)
+    set({ updateCooldownDays: normalized })
   },
   isFullScreen: false,
   setIsFullScreen: (v) => set({ isFullScreen: v }),

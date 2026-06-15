@@ -4745,7 +4745,13 @@
           "31fd7150cf": "Checking for updates...",
           "3394d1f663": "checking",
           "d69a09b672": "Updates are checked automatically on launch.",
-          "7173352632": "idle"
+          "7173352632": "idle",
+          "coolingStatus": "Version {{value0}} is available but held by the update cooldown.",
+          "coolingSettingTitle": "Update cooldown",
+          "coolingSettingDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 disables the delay. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable.",
+          "coolingSettingLabel": "Update cooldown",
+          "coolingSettingSuffix": "days",
+          "coolingSettingControlDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 installs immediately. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable."
         },
         "GeneralWorkspaceSettingsSection": {
           "3d538a98f7": "Choose apps available from a workspace's Open in menu.",
@@ -6875,7 +6881,9 @@
             "7887a2c262": "folder",
             "7baf524b04": "workspace",
             "d0bc793689": "Root directory where workspace folders are created.",
-            "4c95d08fa2": "Workspace Directory"
+            "4c95d08fa2": "Workspace Directory",
+            "coolingSettingTitle": "Update cooldown",
+            "coolingSettingDescription": "Hold new releases for a number of days before installing them, as a supply-chain safeguard."
           }
         },
         "git": {

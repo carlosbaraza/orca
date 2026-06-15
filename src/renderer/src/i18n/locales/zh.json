@@ -4730,7 +4730,13 @@
           "31fd7150cf": "正在检查更新...",
           "3394d1f663": "检查中",
           "d69a09b672": "启动时会自动检查更新。",
-          "7173352632": "idle"
+          "7173352632": "idle",
+          "coolingStatus": "Version {{value0}} is available but held by the update cooldown.",
+          "coolingSettingTitle": "Update cooldown",
+          "coolingSettingDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 disables the delay. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable.",
+          "coolingSettingLabel": "Update cooldown",
+          "coolingSettingSuffix": "days",
+          "coolingSettingControlDescription": "Hold new releases for this many days before installing them, so a compromised update can be caught and pulled first. 0 installs immediately. Overridden by the ORCA_UPDATE_COOLDOWN_DAYS environment variable."
         },
         "GeneralWorkspaceSettingsSection": {
           "3d538a98f7": "从工作区的“打开方式”菜单中选择可用的应用程序。",
@@ -6823,7 +6829,9 @@
             "7887a2c262": "文件夹",
             "7baf524b04": "工作区",
             "d0bc793689": "创建工作区文件夹的根目录。",
-            "4c95d08fa2": "工作区目录"
+            "4c95d08fa2": "工作区目录",
+            "coolingSettingTitle": "Update cooldown",
+            "coolingSettingDescription": "Hold new releases for a number of days before installing them, as a supply-chain safeguard."
           }
         },
         "git": {
