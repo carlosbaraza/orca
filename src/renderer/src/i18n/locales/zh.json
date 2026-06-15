@@ -1613,7 +1613,11 @@
         "a726967bd3": "关闭",
         "d5253b54af": "错误",
         "7ffc08506e": "查看",
-        "522df222b9": "旋转器"
+        "522df222b9": "旋转器",
+        "coolingTitle": "Update Scheduled",
+        "coolingBody": "Orca v{{value0}} installs on {{value1}}.",
+        "coolingExplainer": "New releases are held for a few days as a safeguard against tampered updates.",
+        "coolingInstallNow": "Install now anyway"
       },
       "WorktreeJumpPalette": {
         "ac037cfac2": "手机",

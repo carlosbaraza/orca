@@ -2253,11 +2253,11 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
     } else if (status.state === 'idle') {
       update.updateUserInitiatedCycle = false
     }
-    if (status.state === 'available') {
-      // Why: cache changelog from each 'available' payload so the card retains
-      // rich content across downloading/error/downloaded transitions. Always
-      // overwrite (even with null) to prevent a previous rich changelog from
-      // leaking into a later simple-mode update for a different version.
+    if (status.state === 'available' || status.state === 'cooling') {
+      // Why: cache changelog from each 'available'/'cooling' payload so the card
+      // retains rich content across downloading/error/downloaded transitions.
+      // Always overwrite (even with null) to prevent a previous rich changelog
+      // from leaking into a later simple-mode update for a different version.
       update.updateChangelog = status.changelog ?? null
     } else if (
       status.state === 'idle' ||

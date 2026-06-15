@@ -2296,7 +2296,7 @@ const api = {
     getStatus: () => ipcRenderer.invoke('updater:getStatus'),
     getVersion: () => ipcRenderer.invoke('updater:getVersion'),
     check: (options) => ipcRenderer.invoke('updater:check', options),
-    download: () => ipcRenderer.invoke('updater:download'),
+    download: (options) => ipcRenderer.invoke('updater:download', options),
     dismissNudge: () => ipcRenderer.invoke('updater:dismissNudge'),
     quitAndInstall: async (): Promise<void> => {
       await prepareRendererForAppRestart({
