@@ -211,7 +211,12 @@ const resizeMobileClipboardImage: MobileClipboardImageResizer = async (source, t
     context.resize({ width: target.width })
     const rendered = await context.renderAsync()
     const result = await rendered.saveAsync({ format: SaveFormat.PNG, base64: true })
-    return { data: result.base64 ?? '', width: result.width, height: result.height }
+    // Why: empty base64 would pass the downstream base64 check and upload a corrupt
+    // image, so fail loudly here instead of silently sending an invalid payload.
+    if (!result.base64) {
+      throw new Error('Failed to encode resized clipboard image')
+    }
+    return { data: result.base64, width: result.width, height: result.height }
   } finally {
     try {
       file.delete()
