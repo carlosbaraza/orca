@@ -156,11 +156,18 @@ describe('isTerminalLinkActivation', () => {
 })
 
 describe('handleOscLink', () => {
-  it('ignores http links without the platform modifier', () => {
+  it('routes http links on ordinary click', () => {
     setPlatform('Macintosh')
+    storeState.settings = { openLinksInApp: true }
+    const preventDefault = vi.fn()
 
-    handleOscLink('https://example.com', { metaKey: false, ctrlKey: false }, deps)
+    handleOscLink('https://example.com', { metaKey: false, ctrlKey: false, preventDefault }, deps)
+
     expect(openUrlMock).not.toHaveBeenCalled()
+    expect(createBrowserTabMock).toHaveBeenCalledWith('wt-1', 'https://example.com/', {
+      activate: true
+    })
+    expect(preventDefault).toHaveBeenCalled()
   })
 
   it('routes to the system browser when openLinksInApp is off', () => {
@@ -378,23 +385,17 @@ describe('handleOscLink', () => {
   it('advertises the system default open behavior in hover hints', () => {
     setPlatform('Macintosh')
     expect(getTerminalFileOpenHint()).toBe('⌘+click to open or ⇧⌘+click for default app')
-    expect(getTerminalHtmlFileOpenHint()).toBe('⌘+click to open or ⇧⌘+click for default browser')
+    expect(getTerminalHtmlFileOpenHint()).toBe('click to open or ⇧+click for default browser')
 
     setPlatform('Windows')
     expect(getTerminalFileOpenHint()).toBe('Ctrl+click to open or Shift+Ctrl+click for default app')
-    expect(getTerminalHtmlFileOpenHint()).toBe(
-      'Ctrl+click to open or Shift+Ctrl+click for default browser'
-    )
+    expect(getTerminalHtmlFileOpenHint()).toBe('click to open or Shift+click for default browser')
   })
 
-  it('opens local file URL links in Orca when the platform modifier is pressed', async () => {
+  it('opens local file URL links in Orca on ordinary click', async () => {
     setPlatform('Windows')
 
     handleOscLink('file:///tmp/test.txt', { metaKey: false, ctrlKey: false }, deps)
-    // Without modifier, nothing happens
-    expect(openFilePathMock).not.toHaveBeenCalled()
-
-    handleOscLink('file:///tmp/test.txt', { metaKey: false, ctrlKey: true }, deps)
 
     // openDetectedFilePath is async (fire-and-forget), so flush the microtask queue
     // before asserting on positive behavior.

@@ -1,7 +1,6 @@
 import { resolveTerminalFileLinkText } from '@/lib/terminal-links'
 import { isWindowsAbsolutePathLike } from '../../../../shared/cross-platform-path'
 import type { LinkHandlerDeps } from './terminal-link-handlers'
-import { isTerminalLinkActivation } from './terminal-link-handlers'
 import { resolveTerminalFileUrlTarget } from './terminal-file-url-target'
 import { openDetectedFilePath } from './terminal-file-open-routing'
 import {
@@ -20,13 +19,8 @@ export function handleOscLink(
       requestOpenLinksInAppPreference?: TerminalLinkRoutingPreferenceRequester
     }
 ): void {
-  if (!isTerminalLinkActivation(event)) {
-    return
-  }
-
-  // Why: xterm renders URL links as clickable anchors. Once Orca decides to
-  // handle a modified click itself, we must suppress the browser's default
-  // anchor navigation or Electron will still launch the system browser.
+  // Why: xterm renders OSC 8 links as clickable anchors. Orca must suppress
+  // default anchor navigation so link-routing settings can choose the target.
   // Note: we intentionally do NOT stopPropagation here — xterm's
   // SelectionService listens for mouseup on ownerDocument to clear the
   // pending drag-select state initiated by the mousedown of the same click.
