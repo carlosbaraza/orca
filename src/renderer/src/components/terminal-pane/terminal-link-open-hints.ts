@@ -13,17 +13,17 @@ export function getTerminalOrcaFileOpenHint(): string {
 }
 
 // Why: local .html/.htm links keep the ordinary Orca browser route, with the
-// same Shift+modifier escape hatch to the system default browser as URL links.
+// same Shift escape hatch to the system default browser as URL links.
 export function getTerminalHtmlFileOpenHint(): string {
   return isMacPlatform()
-    ? '⌘+click to open or ⇧⌘+click for default browser'
-    : 'Ctrl+click to open or Shift+Ctrl+click for default browser'
+    ? 'click to open or ⇧+click for default browser'
+    : 'click to open or Shift+click for default browser'
 }
 
 export function getTerminalUrlOpenHint(): string {
   return isMacPlatform()
-    ? '⌘+click to open or ⇧⌘+click for system browser'
-    : 'Ctrl+click to open or Shift+Ctrl+click for system browser'
+    ? 'click to open or ⇧+click for system browser'
+    : 'click to open or Shift+click for system browser'
 }
 
 export function getTerminalWorktreePathOpenHint(canOpenWithSystemDefault: boolean): string {
