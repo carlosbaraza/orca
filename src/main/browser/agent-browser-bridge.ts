@@ -81,6 +81,8 @@ type ResolvedBrowserCommandTarget = {
   webContentsId: number
 }
 
+export type BrowserMouseModifier = 'cmd' | 'ctrl' | 'alt' | 'shift'
+
 type AgentBrowserExecOptions = {
   envOverrides?: NodeJS.ProcessEnv
   timeoutMs?: number
@@ -231,6 +233,25 @@ function cdpMouseButtonMask(button: CdpMouseButton): number {
     return 4
   }
   return 1
+}
+
+function cdpMouseModifierMask(modifiers: BrowserMouseModifier[] | undefined): number {
+  if (!modifiers || modifiers.length === 0) {
+    return 0
+  }
+  let mask = 0
+  for (const modifier of modifiers) {
+    if (modifier === 'alt') {
+      mask |= 1
+    } else if (modifier === 'ctrl') {
+      mask |= 2
+    } else if (modifier === 'cmd') {
+      mask |= 4
+    } else if (modifier === 'shift') {
+      mask |= 8
+    }
+  }
+  return mask
 }
 
 function readClickPoint(value: unknown, fallback: BrowserClickPoint): BrowserClickPoint {
@@ -839,7 +860,8 @@ export class AgentBrowserBridge {
     button?: string,
     worktreeId?: string,
     browserPageId?: string,
-    radius?: number
+    radius?: number,
+    modifiers?: BrowserMouseModifier[]
   ): Promise<unknown> {
     return this.enqueueTargetedCommand(
       worktreeId,
@@ -854,6 +876,7 @@ export class AgentBrowserBridge {
         }
         const cdpButton = normalizeCdpMouseButton(button)
         const buttons = cdpMouseButtonMask(cdpButton)
+        const cdpModifiers = cdpMouseModifierMask(modifiers)
         const lease = acquireElectronDebugger(wc)
         try {
           wc.focus()
@@ -873,6 +896,7 @@ export class AgentBrowserBridge {
               y: point.y,
               button: cdpButton,
               buttons,
+              modifiers: cdpModifiers,
               clickCount: 1
             })
             await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
@@ -881,6 +905,7 @@ export class AgentBrowserBridge {
               y: point.y,
               button: cdpButton,
               buttons: 0,
+              modifiers: cdpModifiers,
               clickCount: 1
             })
           }

@@ -263,10 +263,9 @@ export const XTERM_HTML = `<!DOCTYPE html>
   var terminalGeneration = 0;
   var defaultTheme = ${JSON.stringify(DEFAULT_TERMINAL_THEME)};
   var terminalTheme = defaultTheme;
-  var activeAltScreenSnapshot = false;
-  var trackedMouseTrackingMode = 'none';
-  var sgrMouseMode = false;
-  var sgrMousePixelsMode = false;
+  var activeAltScreenSnapshot = false, trackedMouseTrackingMode = 'none';
+  var sgrMouseMode = false, sgrMousePixelsMode = false;
+  var initialOscLinks = [], initialOscLinkRowOffset = 0;
   var mouseModeScanTail = '';
   var handledMessageIds = [];
   // Why: after init() the initial scrollback applyFitScale may have run
@@ -642,7 +641,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     pumpWrites(terminalGeneration);
   }
 
-  function init(cols, rows, initialData, nextTheme, nextFontScale) {
+  function init(cols, rows, initialData, nextTheme, nextFontScale, nextOscLinks) {
     if (typeof nextFontScale === 'number' && nextFontScale > 0) currentTextScale = nextFontScale;
     terminalGeneration++;
     var gen = terminalGeneration;
@@ -653,10 +652,8 @@ export const XTERM_HTML = `<!DOCTYPE html>
     initRows = rows || 24;
     firstDataPending = true;
     smoothScrollOffsetY = 0;
-    mouseModeScanTail = '';
-    trackedMouseTrackingMode = 'none';
-    sgrMouseMode = false;
-    sgrMousePixelsMode = false;
+    mouseModeScanTail = ''; trackedMouseTrackingMode = 'none';
+    sgrMouseMode = false; sgrMousePixelsMode = false;
     lastEmittedModes = {
       bracketedPasteMode: false,
       altScreen: false,
@@ -669,6 +666,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     // mirrored modes aligned with exactly what this mobile xterm replays.
     updateMouseModeFromData(replayData);
     activeAltScreenSnapshot = isAltScreenActive(replayData);
+    initialOscLinks = Array.isArray(nextOscLinks) ? nextOscLinks : []; initialOscLinkRowOffset = 0;
     var oldTerm = term;
     var oldSurface = surface;
     var nextSurface = null;
@@ -823,7 +821,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
       if (handledMessageIds.length > 256) handledMessageIds.shift();
     }
     if (msg.type === 'init') {
-      init(msg.cols, msg.rows, msg.initialData, msg.terminalTheme, msg.fontScale);
+      init(msg.cols, msg.rows, msg.initialData, msg.terminalTheme, msg.fontScale, msg.oscLinks);
     } else if (msg.type === 'set-font-scale') {
       // Why: ignore RN echoing back the value a pinch just set (msg.fontScale ===
       // currentTextScale) so the post-pinch state isn't reset; only apply changes.
@@ -842,10 +840,8 @@ export const XTERM_HTML = `<!DOCTYPE html>
       resetWriteQueue();
       afterDrainCallbacks = [];
       writesDraining = false;
-      mouseModeScanTail = '';
-      trackedMouseTrackingMode = 'none';
-      sgrMouseMode = false;
-      sgrMousePixelsMode = false;
+      mouseModeScanTail = ''; trackedMouseTrackingMode = 'none';
+      sgrMouseMode = false; sgrMousePixelsMode = false;
       if (term) { term.clear(); term.reset(); }
       emitModesIfChanged();
       resetEvictionCounter();
@@ -903,6 +899,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
   var sel = null; // { anchor:{col,row}, focus:{col,row}, activeHandle:null|'start'|'end' }
   var longPressTimer = null;
   var longPressOrigin = null; // {x,y, identifier}
+  var tapOrigin = null; // {x,y, identifier, moved}
   var edgeScrollTimer = null;
   var edgeScrollDir = 0;
   var edgeScrollClientX = 0;
@@ -931,6 +928,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
 
   function logFeedAndEvict() {
     linesEverWritten++;
+    if (isBufferFull()) initialOscLinkRowOffset += 1;
     if (selMode === 'select' && sel && isBufferFull()) {
       sel.anchor.row -= 1;
       sel.focus.row -= 1;
@@ -1540,11 +1538,15 @@ export const XTERM_HTML = `<!DOCTYPE html>
     }, LONG_PRESS_MS);
   }
 
+  function armTap(touch) { tapOrigin = { x: touch.clientX, y: touch.clientY, identifier: touch.identifier, moved: false }; }
+
   function touchSlopExceeded(t) {
     if (!longPressOrigin) return false;
-    var dx = Math.abs(t.clientX - longPressOrigin.x);
-    var dy = Math.abs(t.clientY - longPressOrigin.y);
-    return (dx + dy) > LONG_PRESS_SLOP;
+    return Math.abs(t.clientX - longPressOrigin.x) + Math.abs(t.clientY - longPressOrigin.y) > LONG_PRESS_SLOP;
+  }
+
+  function updateTapMovement(t) {
+    if (tapOrigin && t.identifier === tapOrigin.identifier && Math.abs(t.clientX - tapOrigin.x) + Math.abs(t.clientY - tapOrigin.y) > 28) tapOrigin.moved = true;
   }
 
   // Why: existing surface handlers stay attached to surface but we wrap
@@ -1600,6 +1602,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     if (inSurface) {
       dispatch.mode = 'surface';
       dispatch.touchId = t.identifier;
+      armTap(t);
       armLongPress(t);
     }
   }, { capture: true, passive: false });
@@ -1617,6 +1620,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
       if (longPressTimer && e.touches.length === 1) {
         if (touchSlopExceeded(e.touches[0])) clearLongPress();
       }
+      if (e.touches.length === 1) updateTapMovement(e.touches[0]);
       // existing surface handler will run from its own listener
     }
   }, { capture: true, passive: false });
@@ -1638,9 +1642,10 @@ export const XTERM_HTML = `<!DOCTYPE html>
       return;
     }
     if (dispatch.mode === 'surface') {
-      if (e.touches.length === 0 && longPressOrigin && selMode !== 'select') {
-        notifyTerminalSurfaceTap(longPressOrigin.x, longPressOrigin.y);
+      if (e.touches.length === 0 && tapOrigin && !tapOrigin.moved && selMode !== 'select') {
+        notifyTerminalSurfaceTap(tapOrigin.x, tapOrigin.y);
       }
+      tapOrigin = null;
       clearLongPress();
       if (e.touches.length === 0) {
         dispatch.mode = 'idle';

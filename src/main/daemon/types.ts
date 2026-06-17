@@ -1,3 +1,5 @@
+import type { TerminalOscLinkRange } from '../../shared/terminal-osc-link-ranges'
+
 // ─── Protocol Version ────────────────────────────────────────────────
 // Why: daemons can survive app updates. Bump for IPC wire-shape changes, or
 // when daemon-baked behavior cannot be delivered by on-disk wrapper refresh.
@@ -19,6 +21,7 @@ export type TerminalSnapshot = {
   /** Scrollback portion only (rows above the visible viewport). Write this
    *  to preserve history without interfering with TUI repaints. */
   scrollbackAnsi: string
+  oscLinks?: TerminalOscLinkRange[]
   rehydrateSequences: string
   cwd: string | null
   modes: TerminalModes

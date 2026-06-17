@@ -57,19 +57,45 @@ export const URL_TAP_WEBVIEW_JS = `
   }
   function oscLinkAtViewportPoint(clientX, clientY) {
     try {
-      var svc = oscLinkService();
-      if (!svc || !svc.getLinkData) return null;
       var cell = viewportToCell(clientX, clientY);
       if (!cell) return null;
       var line = term.buffer.active.getLine(cell.row);
       if (!line) return null;
-      var bufCell = line.getCell(cell.col);
-      var urlId = bufCell && bufCell.extended && bufCell.extended.urlId;
-      if (!urlId) return null;
+      var urlId = oscLinkIdNearCell(line, cell.col);
+      if (!urlId) return initialOscLinkAtCell(cell.row, cell.col);
+      var svc = oscLinkService();
+      if (!svc || !svc.getLinkData) return initialOscLinkAtCell(cell.row, cell.col);
       var data = svc.getLinkData(urlId);
       var uri = data && data.uri;
       return uri && /^https?:/i.test(uri) ? uri : null;
     } catch (e) { return null; }
+  }
+  function initialOscLinkAtCell(row, col) {
+    for (var i = 0; i < initialOscLinks.length; i++) {
+      var link = initialOscLinks[i];
+      if (!link || typeof link.uri !== 'string' || !/^https?:/i.test(link.uri)) continue;
+      if (link.row < initialOscLinkRowOffset) continue;
+      var shiftedRow = link.row - initialOscLinkRowOffset;
+      if (shiftedRow === row && col >= link.startCol && col < link.endCol) return link.uri;
+    }
+    return null;
+  }
+  function oscLinkIdAtCell(line, col) {
+    try {
+      var bufCell = line.getCell(col);
+      return bufCell && bufCell.extended && bufCell.extended.urlId ? bufCell.extended.urlId : 0;
+    } catch (e) { return 0; }
+  }
+  function oscLinkIdNearCell(line, col) {
+    var exact = oscLinkIdAtCell(line, col);
+    if (exact) return exact;
+    var max = Math.min(16, Math.max(term && term.cols ? term.cols : 0, line.length || 0));
+    for (var offset = 1; offset <= max; offset++) {
+      var left = col - offset, right = col + offset;
+      var id = left >= 0 ? oscLinkIdAtCell(line, left) : 0; if (id) return id;
+      id = right < line.length ? oscLinkIdAtCell(line, right) : 0; if (id) return id;
+    }
+    return 0;
   }
 
   function notifyTerminalSurfaceTap(originX, originY) {

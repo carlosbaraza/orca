@@ -4,10 +4,12 @@ import { WebView } from 'react-native-webview'
 import type { WebViewMessageEvent } from 'react-native-webview'
 import type { RuntimeMobileTerminalTheme } from '../../../src/shared/runtime-types'
 import { colors } from '../theme/mobile-theme'
+import type { TerminalOscLinkRange } from './terminal-osc-link-ranges'
 import { XTERM_HTML } from './terminal-webview-html'
 import type { TerminalWebViewCommand } from './terminal-webview-messages'
 
 type TerminalMouseTrackingMode = 'none' | 'x10' | 'vt200' | 'drag' | 'any'
+type TerminalOscLinks = TerminalOscLinkRange[]
 
 export type TerminalModes = {
   bracketedPasteMode: boolean
@@ -45,25 +47,22 @@ export type TerminalSelectionEvents = {
 
 export type TerminalWebViewHandle = {
   write: (data: string) => void
-  init: (cols: number, rows: number, initialData?: string) => void
+  init: (cols: number, rows: number, initialData?: string, oscLinks?: TerminalOscLinks) => void
   resize: (cols: number, rows: number) => void
   clear: () => void
   measureFitDimensions: (containerHeight?: number) => Promise<{ cols: number; rows: number } | null>
   resetZoom: () => void
   cancelSelect: () => void
   doSelectAll: () => void
-  // Why: lets callers await the WebView-side `init` rAF chain (term.open
-  // → renderService population → first paint) so a follow-up measure
-  // doesn't race ahead and find term=null or cellWidth=0. Resolves on
-  // the next 'ready' notify after the most recent init.
+  // Why: lets callers await WebView-side init so follow-up measures do not
+  // race term.open/renderService/first paint.
   awaitReady: () => Promise<void>
 }
 
 type Props = {
   style?: StyleProp<ViewStyle>
   terminalTheme?: MobileTerminalTheme
-  // Why: baseline zoom multiplier ("text size") applied on top of the fit-to-width
-  // scale; raw xterm fontSize can't drive apparent size because the fit cancels it.
+  // Why: baseline zoom multiplier applied on top of fit-to-width scale.
   textScale?: number
   onWebReady?: () => void
 } & TerminalSelectionEvents
@@ -101,10 +100,7 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
   const measureResolveRef = useRef<
     ((result: { cols: number; rows: number } | null) => void) | null
   >(null)
-  // Why: each init() call posts 'init' to the WebView and arms a fresh
-  // ready promise. WebView's init() rAF chain ends with a 'ready' notify
-  // that resolves it. measureFitDimensions awaits this so it doesn't
-  // race ahead of term.open() / renderService population.
+  // Why: init arms a ready promise so measureFitDimensions waits for xterm paint.
   const readyPromiseRef = useRef<Promise<void> | null>(null)
   const readyResolveRef = useRef<(() => void) | null>(null)
 
@@ -314,7 +310,7 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
       write(data: string) {
         postMessage({ type: 'write', data })
       },
-      init(cols: number, rows: number, initialData?: string) {
+      init(cols: number, rows: number, initialData?: string, oscLinks?: TerminalOscLinkRange[]) {
         // Why: arm a fresh ready promise BEFORE posting init. The WebView
         // resolves it via the 'ready' notify at the end of its rAF chain.
         // Resolve any prior in-flight ready first so awaiters from the
@@ -331,7 +327,15 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
         readyPromiseRef.current = new Promise<void>((resolve) => {
           readyResolveRef.current = resolve
         })
-        postMessage({ type: 'init', cols, rows, initialData, terminalTheme, fontScale: textScale })
+        postMessage({
+          type: 'init',
+          cols,
+          rows,
+          initialData,
+          oscLinks,
+          terminalTheme,
+          fontScale: textScale
+        })
       },
       resize(cols: number, rows: number) {
         postMessage({ type: 'resize', cols, rows })

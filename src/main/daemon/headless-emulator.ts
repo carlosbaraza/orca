@@ -2,6 +2,7 @@ import './xterm-env-polyfill'
 import { Terminal } from '@xterm/headless'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { extractLastOscTitle } from '../../shared/agent-detection'
+import { collectHeadlessOscLinkRanges } from './headless-osc-link-ranges'
 import { parseFileUriPath } from './osc7-file-uri'
 import type { TerminalSnapshot, TerminalModes } from './types'
 
@@ -134,6 +135,7 @@ export class HeadlessEmulator {
     return {
       snapshotAnsi,
       scrollbackAnsi: '',
+      oscLinks: collectHeadlessOscLinkRanges(this.terminal, opts.scrollbackRows),
       rehydrateSequences: this.buildRehydrateSequences(modes),
       cwd: this.cwd,
       modes,

@@ -48,6 +48,20 @@ describe('HeadlessEmulator', () => {
       const snapshot = emulator.getSnapshot()
       expect(snapshot.snapshotAnsi).toContain('red text')
     })
+
+    it('captures OSC 8 link ranges in snapshot metadata', async () => {
+      emulator = new HeadlessEmulator({ cols: 80, rows: 24 })
+      await emulator.write('\x1b]8;;https://news.ycombinator.com\x07Hacker News\x1b]8;;\x07')
+
+      expect(emulator.getSnapshot().oscLinks).toEqual([
+        {
+          row: 0,
+          startCol: 0,
+          endCol: 11,
+          uri: 'https://news.ycombinator.com'
+        }
+      ])
+    })
   })
 
   describe('OSC-7 CWD tracking', () => {

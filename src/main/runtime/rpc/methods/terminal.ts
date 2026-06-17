@@ -13,6 +13,7 @@ import {
   type TerminalStreamFrame
 } from '../../../../shared/terminal-stream-protocol'
 import { TERMINAL_PANE_SPLIT_SOURCES } from '../../../../shared/feature-education-telemetry'
+import type { TerminalOscLinkRange } from '../../../../shared/terminal-osc-link-ranges'
 
 // Why: when a mobile client subscribes the server resizes the PTY to phone
 // dims and serializes the buffer. Sending only the visible screen meant
@@ -45,6 +46,7 @@ type SnapshotFrameOptions = {
   truncated?: boolean
   truncatedByByteBudget?: boolean
   source?: 'headless' | 'renderer'
+  oscLinks?: TerminalOscLinkRange[]
 }
 
 type SerializedSnapshot = {
@@ -53,6 +55,7 @@ type SerializedSnapshot = {
   rows: number
   seq?: number
   source?: 'headless' | 'renderer'
+  oscLinks?: TerminalOscLinkRange[]
   scrollbackRows: number
   truncatedByByteBudget: boolean
 } | null
@@ -324,6 +327,7 @@ function sendSnapshotFrames(
       reason: options.reason,
       seq: options.seq,
       source: options.source,
+      oscLinks: options.oscLinks,
       truncated: options.truncated === true,
       truncatedByByteBudget: options.truncatedByByteBudget === true
     })
@@ -1067,6 +1071,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             displayMode,
             seq: serialized?.seq,
             source: serialized?.source,
+            oscLinks: serialized?.oscLinks,
             truncated: false,
             truncatedByByteBudget: serialized?.truncatedByByteBudget,
             data: serialized?.data ?? ''
@@ -1236,6 +1241,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             truncated: serialized ? read.truncated : isTerminalReadPayloadIncomplete(read),
             truncatedByByteBudget: serialized?.truncatedByByteBudget,
             source: serialized?.source,
+            oscLinks: serialized?.oscLinks,
             data: serialized?.data ?? (read.tail.length > 0 ? `${read.tail.join('\r\n')}\r\n` : '')
           })
           stream.buffering = false
@@ -1358,6 +1364,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           lines: read.tail,
           truncated: isTerminalReadPayloadIncomplete(read),
           serialized: serialized?.data,
+          oscLinks: serialized?.oscLinks,
           cols: serialized?.cols ?? size?.cols,
           rows: serialized?.rows ?? size?.rows,
           displayMode,
@@ -1554,6 +1561,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           seq,
           truncated: serialized ? read.truncated : isTerminalReadPayloadIncomplete(read),
           truncatedByByteBudget: serialized?.truncatedByByteBudget,
+          oscLinks: serialized?.oscLinks,
           data: serialized?.data ?? ''
         })
         console.log('[mobile-terminal-stream] snapshot', {

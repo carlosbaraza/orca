@@ -12,8 +12,8 @@ export function getTerminalOrcaFileOpenHint(): string {
   return isMacPlatform() ? '⌘+click to open in Orca' : 'Ctrl+click to open in Orca'
 }
 
-// Why: local .html/.htm links keep the ordinary Orca browser route, with the
-// same Shift escape hatch to the system default browser as URL links.
+// Why: OSC-provided local .html/.htm links open like URL links, with the
+// same Shift escape hatch to the system default browser.
 export function getTerminalHtmlFileOpenHint(): string {
   return isMacPlatform()
     ? 'click to open or ⇧+click for default browser'
