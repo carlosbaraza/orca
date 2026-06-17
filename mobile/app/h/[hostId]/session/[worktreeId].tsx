@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Animated, AppState, Linking, type AppStateStatus } from 'react-native'
 import * as Clipboard from 'expo-clipboard'
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator'
+import { File as FsFile, Paths } from 'expo-file-system'
 import {
   BackHandler,
   FlatList,
@@ -133,7 +135,9 @@ import {
 } from '../../../../src/session/mobile-new-tab-agent-options'
 import {
   buildMobileImagePastePayload,
-  saveMobileClipboardImageAsTempFile
+  prepareMobileClipboardImageBase64,
+  saveMobileClipboardImageAsTempFile,
+  type MobileClipboardImageResizer
 } from '../../../../src/session/mobile-clipboard-image'
 import { useMobileImageAttachment } from '../../../../src/session/use-mobile-image-attachment'
 import { classifyMobileArtifact } from '../../../../src/session/mobile-artifact-kind'
@@ -190,6 +194,32 @@ import type {
   TerminalGestureInputBucket,
   TerminalGestureInputQueue
 } from './mobile-session-route-types'
+
+const CLIPBOARD_IMAGE_DATA_URL_PREFIX_RE = /^data:image\/[a-z0-9.+-]+;base64,/i
+
+// Why: clipboard images are re-encoded as lossless PNG, so high-res screenshots and
+// photos can exceed the upload byte budget; resize the raster down to fit before upload.
+// The image is staged to a temp file first because the iOS ImageManipulator loader
+// (Data(contentsOf:)) cannot decode large base64 data URIs — it needs a file:// URI.
+const resizeMobileClipboardImage: MobileClipboardImageResizer = async (source, target) => {
+  const base64 = source.replace(CLIPBOARD_IMAGE_DATA_URL_PREFIX_RE, '')
+  const file = new FsFile(Paths.cache, `orca-clip-resize-${Date.now()}.png`)
+  try {
+    file.create({ overwrite: true })
+    file.write(base64, { encoding: 'base64' })
+    const context = ImageManipulator.manipulate(file.uri)
+    context.resize({ width: target.width })
+    const rendered = await context.renderAsync()
+    const result = await rendered.saveAsync({ format: SaveFormat.PNG, base64: true })
+    return { data: result.base64 ?? '', width: result.width, height: result.height }
+  } finally {
+    try {
+      file.delete()
+    } catch {
+      // Best-effort cleanup; the OS reclaims the cache directory regardless.
+    }
+  }
+}
 
 function getActiveTabIdForHandle(
   tabs: MobileSessionTab[],
@@ -3377,7 +3407,8 @@ export default function SessionScreen() {
           return
         }
         const connectionId = await getActiveWorktreeConnectionId()
-        const imagePath = await saveMobileClipboardImageAsTempFile(client, image.data, {
+        const base64 = await prepareMobileClipboardImageBase64(image, resizeMobileClipboardImage)
+        const imagePath = await saveMobileClipboardImageAsTempFile(client, base64, {
           connectionId
         })
         payload = buildMobileImagePastePayload(imagePath)
