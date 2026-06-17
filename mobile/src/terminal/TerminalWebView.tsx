@@ -116,7 +116,7 @@ const XTERM_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.198/css/xterm.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/css/xterm.min.css">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
@@ -135,7 +135,7 @@ const XTERM_HTML = `<!DOCTYPE html>
     transform-origin: top left;
     display: inline-block;
   }
-  .xterm { -webkit-user-select: none; user-select: none; }
+  .xterm { -webkit-user-select: none; user-select: none; font-variant-emoji: text; }
   .xterm .xterm-viewport {
     overflow-y: hidden !important;
     scrollbar-width: none !important;
@@ -261,12 +261,14 @@ const XTERM_HTML = `<!DOCTYPE html>
     <button id="sel-menu-all">Select All</button>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.198/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/lib/xterm.min.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.10.0-beta.285/lib/addon-unicode11.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.20.0-beta.285/lib/addon-webgl.js"></script>
 <script>
 (function() {
   var surface = document.getElementById('terminal-surface');
   var ESC = String.fromCharCode(27);
   var C1_CSI = String.fromCharCode(155);
+  var CLAUDE_STATUS_DOT = String.fromCharCode(0x23fa), TEXT_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0e);
+  var CLAUDE_STATUS_DOT_PATTERN = new RegExp(CLAUDE_STATUS_DOT + String.fromCharCode(0xfe0f) + '?', 'g');
   var PRIVATE_MODE_SCAN_TAIL_LIMIT = 4096;
   var term = null;
   var scrollIndicator = document.getElementById('scroll-indicator');
@@ -440,19 +442,6 @@ const XTERM_HTML = `<!DOCTYPE html>
     // changes cursor coordinates and makes TUI repaint chunks duplicate or
     // overlap existing frames. Keep xterm rows identical to the PTY.
     return;
-    if (!term || !term.element) return;
-    // Why: active alternate-screen TUIs (Claude Code, vim, etc.) are exact
-    // screen snapshots. Locally resizing the mobile xterm after replay can
-    // mutate the alt buffer and drop cell attributes, which shows as white text.
-    if (activeAltScreenSnapshot) return;
-    var cellHeight = getCellHeight();
-    if (cellHeight > 0 && currentScale > 0) {
-      var vpHeight = window.innerHeight;
-      var neededRows = Math.floor(vpHeight / (cellHeight * currentScale));
-      if (neededRows >= initRows && neededRows !== term.rows) {
-        term.resize(term.cols, neededRows);
-      }
-    }
   }
 
   // Why: cold-start fit. After init() opens xterm, the renderer needs
@@ -598,8 +587,11 @@ const XTERM_HTML = `<!DOCTYPE html>
     writeQueueHead = 0;
   }
 
+  // Why: iOS WebKit promotes Claude's record/status dot to a colorful emoji glyph.
+  function normalizeStatusDotPresentation(data) { return typeof data === 'string' && data.length > 0 ? data.replace(CLAUDE_STATUS_DOT_PATTERN, CLAUDE_STATUS_DOT + TEXT_PRESENTATION_SELECTOR) : data; }
+
   function enqueueWrite(data) {
-    writeQueue.push(data);
+    writeQueue.push(normalizeStatusDotPresentation(data));
   }
 
   function nextQueuedWrite() {
@@ -715,8 +707,10 @@ const XTERM_HTML = `<!DOCTYPE html>
       cols: cols || 80,
       rows: rows || 24,
       theme: terminalTheme,
-      fontFamily: '"Menlo", "Consolas", "DejaVu Sans Mono", monospace',
+      fontFamily: '"SF Mono", "Menlo", "Monaco", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Liberation Mono", "Symbols Nerd Font Mono", monospace',
       fontSize: 13,
+      fontWeight: '300',
+      fontWeightBold: '500',
       scrollback: 5000,
       disableStdin: true,
       cursorBlink: false,
@@ -726,6 +720,10 @@ const XTERM_HTML = `<!DOCTYPE html>
       allowProposedApi: true
     });
     term.open(surface);
+    if (window.WebglAddon && window.WebglAddon.WebglAddon) {
+      try { var webglAddon = new window.WebglAddon.WebglAddon(); term.loadAddon(webglAddon); if (webglAddon.onContextLoss) webglAddon.onContextLoss(function() { try { webglAddon && webglAddon.dispose && webglAddon.dispose(); } catch (e) {} }); } catch (e) {}
+    }
+    if (window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon) try { term.loadAddon(new window.Unicode11Addon.Unicode11Addon()); term.unicode.activeVersion = '11'; } catch (e) {}
     if (typeof replayData === 'string' && replayData.length > 0) {
       enqueueWrite(replayData);
     }
