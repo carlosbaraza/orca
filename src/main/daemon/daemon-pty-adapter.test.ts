@@ -8,10 +8,13 @@ import { DaemonServer } from './daemon-server'
 import { getHistorySessionDirName } from './history-paths'
 import type { SubprocessHandle } from './session'
 import type * as DaemonHealthModule from './daemon-health'
+import { getDaemonSocketPath } from './daemon-spawner'
 
 const { getMacDaemonSystemResolverHealthMock } = vi.hoisted(() => ({
   getMacDaemonSystemResolverHealthMock: vi.fn(async () => 'unknown')
 }))
+
+const itOnPosix = process.platform === 'win32' ? it.skip : it
 
 vi.mock('./daemon-health', async (importOriginal) => {
   const actual = await importOriginal<typeof DaemonHealthModule>()
@@ -85,7 +88,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
 
   beforeEach(async () => {
     dir = createTestDir()
-    socketPath = join(dir, 'test.sock')
+    socketPath = getDaemonSocketPath(dir)
     tokenPath = join(dir, 'test.token')
 
     server = new DaemonServer({
@@ -121,6 +124,37 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
     it('uses worktreeId as session prefix when provided', async () => {
       const result = await adapter.spawn({ cols: 80, rows: 24, worktreeId: 'wt-1' })
       expect(result.id).toContain('wt-1')
+    })
+
+    itOnPosix('keeps plain Codex startup on the short daemon shell-ready timeout', async () => {
+      await adapter.spawn({
+        cols: 80,
+        rows: 24,
+        command: 'codex',
+        env: { SHELL: '/bin/zsh' }
+      })
+
+      await waitFor(() => vi.mocked(lastSubprocess.write).mock.calls.length > 0)
+      expect(lastSubprocess.write).toHaveBeenCalledWith('codex\n')
+    })
+
+    itOnPosix('waits for shell-ready for delivery-hinted Codex startup', async () => {
+      await adapter.spawn({
+        cols: 80,
+        rows: 24,
+        command: "codex 'linked issue context'",
+        startupCommandDelivery: 'shell-ready',
+        env: { SHELL: '/bin/zsh' }
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 350))
+      expect(lastSubprocess.write).not.toHaveBeenCalled()
+
+      lastSubprocess._simulateData('\x1b]777;orca-shell-ready\x07')
+      lastSubprocess._simulateData('\r\nuser@host $ ')
+
+      await waitFor(() => vi.mocked(lastSubprocess.write).mock.calls.length > 0)
+      expect(lastSubprocess.write).toHaveBeenCalledWith("codex 'linked issue context'\n")
     })
   })
 

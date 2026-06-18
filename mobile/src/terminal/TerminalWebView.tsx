@@ -7,6 +7,7 @@ import { colors } from '../theme/mobile-theme'
 import type { TerminalOscLinkRange } from './terminal-osc-link-ranges'
 import { XTERM_HTML } from './terminal-webview-html'
 import type { TerminalWebViewCommand } from './terminal-webview-messages'
+import { createTerminalWebViewPendingMessages } from './terminal-webview-pending-messages'
 
 type TerminalMouseTrackingMode = 'none' | 'x10' | 'vt200' | 'drag' | 'any'
 type TerminalOscLinks = TerminalOscLinkRange[]
@@ -47,28 +48,42 @@ export type TerminalSelectionEvents = {
 
 export type TerminalWebViewHandle = {
   write: (data: string) => void
-  init: (cols: number, rows: number, initialData?: string, oscLinks?: TerminalOscLinks) => void
+  init: (
+    cols: number,
+    rows: number,
+    initialData?: string,
+    preserveScroll?: boolean,
+    oscLinks?: TerminalOscLinks
+  ) => void
   resize: (cols: number, rows: number) => void
+  // Why: reflow the local xterm buffer (scrollback included) to a new width
+  // after a server-side PTY reflow, so older wrapped lines rewrap to match the
+  // latest output. No-op on the alternate screen.
+  reflow: (cols: number, rows: number) => void
   clear: () => void
   measureFitDimensions: (containerHeight?: number) => Promise<{ cols: number; rows: number } | null>
   resetZoom: () => void
   cancelSelect: () => void
   doSelectAll: () => void
-  // Why: lets callers await WebView-side init so follow-up measures do not
-  // race term.open/renderService/first paint.
+  // Why: lets callers await the WebView-side `init` rAF chain (term.open
+  // → renderService population → first paint) so a follow-up measure
+  // doesn't race ahead and find term=null or cellWidth=0. Resolves on
+  // the next 'ready' notify after the most recent init.
   awaitReady: () => Promise<void>
 }
 
 type Props = {
   style?: StyleProp<ViewStyle>
   terminalTheme?: MobileTerminalTheme
-  // Why: baseline zoom multiplier applied on top of fit-to-width scale.
+  // Why: baseline zoom multiplier ("text size") applied on top of the fit-to-width
+  // scale; raw xterm fontSize can't drive apparent size because the fit cancels it.
   textScale?: number
   onWebReady?: () => void
 } & TerminalSelectionEvents
 
-const MAX_PENDING_WEB_WRITE_BYTES = 1_000_000
-const MAX_PENDING_WEB_WRITE_MESSAGES = 4096
+// Why: WebView treats source identity as page identity on some platforms; keep
+// parent/session re-renders from reloading xterm and forcing fresh snapshots.
+const XTERM_WEBVIEW_SOURCE = { html: XTERM_HTML }
 
 export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function TerminalWebView(
   {
@@ -92,15 +107,16 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
 ) {
   const webViewRef = useRef<WebView>(null)
   const isWebReadyRef = useRef(false)
-  const pendingMessagesRef = useRef<TerminalWebViewCommand[]>([])
-  const pendingWriteBytesRef = useRef(0)
-  const pendingWriteCountRef = useRef(0)
+  const pendingMessages = useMemo(() => createTerminalWebViewPendingMessages(), [])
   const messageIdRef = useRef(0)
   const terminalThemeKey = useMemo(() => JSON.stringify(terminalTheme ?? null), [terminalTheme])
   const measureResolveRef = useRef<
     ((result: { cols: number; rows: number } | null) => void) | null
   >(null)
-  // Why: init arms a ready promise so measureFitDimensions waits for xterm paint.
+  // Why: each init() call posts 'init' to the WebView and arms a fresh
+  // ready promise. WebView's init() rAF chain ends with a 'ready' notify
+  // that resolves it. measureFitDimensions awaits this so it doesn't
+  // race ahead of term.open() / renderService population.
   const readyPromiseRef = useRef<Promise<void> | null>(null)
   const readyResolveRef = useRef<(() => void) | null>(null)
 
@@ -110,60 +126,18 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
   }, [])
 
   const flushPendingMessages = useCallback(() => {
-    const pending = pendingMessagesRef.current
-    pendingMessagesRef.current = []
-    pendingWriteBytesRef.current = 0
-    pendingWriteCountRef.current = 0
-    for (const msg of pending) {
-      sendToWebView(msg)
-    }
-  }, [sendToWebView])
-
-  const clearPendingMessages = useCallback(() => {
-    pendingMessagesRef.current = []
-    pendingWriteBytesRef.current = 0
-    pendingWriteCountRef.current = 0
-  }, [])
-
-  const queuePendingMessage = useCallback((msg: TerminalWebViewCommand) => {
-    const pending = pendingMessagesRef.current
-    pending.push(msg)
-    if (msg.type !== 'write') {
-      return
-    }
-
-    pendingWriteBytesRef.current += msg.data.length
-    pendingWriteCountRef.current += 1
-    while (
-      pendingWriteBytesRef.current > MAX_PENDING_WEB_WRITE_BYTES ||
-      pendingWriteCountRef.current > MAX_PENDING_WEB_WRITE_MESSAGES
-    ) {
-      const dropIndex = pending.findIndex((candidate) => candidate.type === 'write')
-      if (dropIndex === -1) {
-        pendingWriteBytesRef.current = 0
-        pendingWriteCountRef.current = 0
-        return
-      }
-      const [dropped] = pending.splice(dropIndex, 1)
-      if (dropped?.type === 'write') {
-        pendingWriteBytesRef.current = Math.max(
-          0,
-          pendingWriteBytesRef.current - dropped.data.length
-        )
-        pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1)
-      }
-    }
-  }, [])
+    pendingMessages.flush(sendToWebView)
+  }, [pendingMessages, sendToWebView])
 
   const postMessage = useCallback(
     (msg: TerminalWebViewCommand) => {
       if (!isWebReadyRef.current) {
-        queuePendingMessage(msg)
+        pendingMessages.queue(msg)
         return
       }
       sendToWebView(msg)
     },
-    [queuePendingMessage, sendToWebView]
+    [pendingMessages, sendToWebView]
   )
 
   const handleMessage = useCallback(
@@ -291,8 +265,8 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
     isWebReadyRef.current = false
     // Why: messages queued for a previous WebView generation are stale after a reload;
     // dropping them avoids replaying terminal chunks before the next init snapshot.
-    clearPendingMessages()
-  }, [clearPendingMessages])
+    pendingMessages.clear()
+  }, [pendingMessages])
 
   useEffect(() => {
     postMessage({ type: 'set-theme', terminalTheme })
@@ -310,7 +284,13 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
       write(data: string) {
         postMessage({ type: 'write', data })
       },
-      init(cols: number, rows: number, initialData?: string, oscLinks?: TerminalOscLinkRange[]) {
+      init(
+        cols: number,
+        rows: number,
+        initialData?: string,
+        preserveScroll?: boolean,
+        oscLinks?: TerminalOscLinks
+      ) {
         // Why: arm a fresh ready promise BEFORE posting init. The WebView
         // resolves it via the 'ready' notify at the end of its rAF chain.
         // Resolve any prior in-flight ready first so awaiters from the
@@ -334,11 +314,15 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
           initialData,
           oscLinks,
           terminalTheme,
-          fontScale: textScale
+          fontScale: textScale,
+          preserveScroll
         })
       },
       resize(cols: number, rows: number) {
         postMessage({ type: 'resize', cols, rows })
+      },
+      reflow(cols: number, rows: number) {
+        postMessage({ type: 'reflow', cols, rows })
       },
       clear() {
         postMessage({ type: 'clear' })
@@ -413,7 +397,7 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
   return (
     <WebView
       ref={webViewRef}
-      source={{ html: XTERM_HTML }}
+      source={XTERM_WEBVIEW_SOURCE}
       style={[styles.webview, style]}
       originWhitelist={['*']}
       javaScriptEnabled

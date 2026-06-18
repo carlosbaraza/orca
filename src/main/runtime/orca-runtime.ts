@@ -43,6 +43,7 @@ import type {
   AutomationWorkspaceMode
 } from '../../shared/automations-types'
 import type {
+  AutomationWorkspaceProvenance,
   BaseRefSearchResult,
   CreateWorktreeResult,
   DetectedWorktree,
@@ -56,6 +57,7 @@ import type {
   GlobalSettings,
   PersistedUIState,
   Project,
+  ProjectUpdateArgs,
   ProjectHostSetup,
   ProjectHostSetupCloneArgs,
   ProjectHostSetupCreateArgs,
@@ -173,12 +175,14 @@ import {
   isPathInsideOrEqual,
   normalizeRuntimePathForComparison
 } from '../../shared/cross-platform-path'
+import { isWslUncPath } from '../../shared/wsl-paths'
 import {
   folderWorkspaceKey,
   isWorkspaceKey,
   parseWorkspaceKey,
   worktreeWorkspaceKey
 } from '../../shared/workspace-scope'
+import { folderWorkspaceToWorktree } from '../../shared/folder-workspace-worktree'
 import type {
   FolderWorkspacePathStatus,
   FolderWorkspacePathStatusRequest
@@ -367,6 +371,17 @@ import {
   getHostedReviewCreationEligibility as getHostedReviewCreationEligibilityFromRepo
 } from '../source-control/hosted-review-creation'
 import {
+  getLocalProjectGitExecOptions,
+  getLocalProjectWorktreeGitOptions,
+  resolveLocalProjectRuntimeForRepo
+} from '../project-runtime-git-options'
+import type { ProjectExecutionRuntimeResolution } from '../../shared/project-execution-runtime'
+import {
+  getLocalWorktreePathAccess,
+  removeLocalWorktreePath,
+  toLocalWorktreeRuntimePath
+} from '../local-worktree-filesystem'
+import {
   connect as connectLinear,
   disconnect as disconnectLinear,
   getStatus as getLinearStatus,
@@ -516,7 +531,7 @@ import {
   forceDeleteLocalBranch,
   removeWorktree
 } from '../git/worktree'
-import type { AddWorktreeResult } from '../git/worktree'
+import type { AddWorktreeOptions, AddWorktreeResult } from '../git/worktree'
 import { isENOENT } from '../ipc/filesystem-auth'
 import {
   createSetupRunnerScript,
@@ -535,7 +550,7 @@ import {
 } from '../hooks'
 import { DEFAULT_REPO_BADGE_COLOR, getDefaultVoiceSettings } from '../../shared/constants'
 import { listRepoWorktrees } from '../repo-worktrees'
-import { createWorktreeSymlinks } from '../ipc/worktree-symlinks'
+import { createWorktreeLinkedPaths, removeWorktreeLinkedPaths } from '../ipc/worktree-symlinks'
 import { deleteWorktreeHistoryDir } from '../terminal-history'
 import {
   cleanupUnusedWorktreePushTargetRemote,
@@ -638,6 +653,7 @@ type RuntimeStore = {
   addRepo: Store['addRepo']
   updateRepo: Store['updateRepo']
   getProjects?: Store['getProjects']
+  updateProject?: Store['updateProject']
   getProjectHostSetups?: Store['getProjectHostSetups']
   createProjectHostSetup?: Store['createProjectHostSetup']
   updateProjectHostSetup?: Store['updateProjectHostSetup']
@@ -697,6 +713,7 @@ type RuntimeStore = {
     defaultRepoSelection?: GlobalSettings['defaultRepoSelection']
     defaultLinearTeamSelection?: GlobalSettings['defaultLinearTeamSelection']
     githubProjects?: GlobalSettings['githubProjects']
+    experimentalNewWorktreeCardStyle?: GlobalSettings['experimentalNewWorktreeCardStyle']
     gitlabProjects?: GlobalSettings['gitlabProjects']
     experimentalWorktreeSymlinks?: boolean
     mobileAutoRestoreFitMs?: number | null
@@ -887,6 +904,7 @@ type RuntimePtyController = {
     rows: number
     cwd?: string
     command?: string
+    startupCommandDelivery?: WorktreeStartupLaunch['startupCommandDelivery']
     env?: Record<string, string>
     envToDelete?: string[]
     telemetry?: WorktreeStartupLaunch['telemetry']
@@ -927,8 +945,17 @@ type WorktreeStartupFollowup = {
   prompt: string
 }
 
-function getAgentLaunchPlatformForRepo(repo: Pick<Repo, 'connectionId' | 'path'>): NodeJS.Platform {
+function getAgentLaunchPlatformForRepo(
+  repo: Pick<Repo, 'connectionId' | 'path'>,
+  projectRuntime?: ProjectExecutionRuntimeResolution
+): NodeJS.Platform {
   if (!repo.connectionId) {
+    if (projectRuntime?.status === 'repair-required') {
+      return projectRuntime.repair.preferredRuntime.kind === 'wsl' ? 'linux' : process.platform
+    }
+    if (projectRuntime?.status === 'resolved' && projectRuntime.runtime.kind === 'wsl') {
+      return 'linux'
+    }
     return process.platform
   }
   return isWindowsAbsolutePathLike(repo.path) ? 'win32' : 'linux'
@@ -1060,9 +1087,17 @@ function omitUndefinedProperties<T extends Record<string, unknown>>(value: T): P
   ) as Partial<T>
 }
 
-async function isRuntimeWorktreePathMissing(repo: Repo, worktreePath: string): Promise<boolean> {
+async function isRuntimeWorktreePathMissing(
+  repo: Repo,
+  worktreePath: string,
+  localWorktreeGitOptions: { wslDistro?: string } = {}
+): Promise<boolean> {
   if (!repo.connectionId) {
-    return isWorktreePathMissing(worktreePath)
+    const access = getLocalWorktreePathAccess(localWorktreeGitOptions)
+    return isWorktreePathMissing(
+      toLocalWorktreeRuntimePath(worktreePath, localWorktreeGitOptions),
+      access.statPath
+    )
   }
 
   const fsProvider = getSshFilesystemProvider(repo.connectionId)
@@ -1150,6 +1185,9 @@ function mergeRuntimeFolderWorkspace(repo: Repo, worktreeId: string, meta: Workt
     lastActivityAt: meta.lastActivityAt ?? 0,
     ...(meta.createdAt !== undefined ? { createdAt: meta.createdAt } : {}),
     ...(meta.createdWithAgent !== undefined ? { createdWithAgent: meta.createdWithAgent } : {}),
+    ...(meta.automationProvenance !== undefined
+      ? { automationProvenance: meta.automationProvenance }
+      : {}),
     workspaceStatus: meta.workspaceStatus ?? DEFAULT_WORKSPACE_STATUS_ID,
     diffComments: meta.diffComments,
     mobileDiffReview: meta.mobileDiffReview
@@ -1209,7 +1247,8 @@ async function resolveCreateBranchName(
   branchNameOverride: string | undefined,
   sanitizedName: string,
   settings: { branchPrefix: string; branchPrefixCustom?: string },
-  username: string | null
+  username: string | null,
+  gitOptions: { wslDistro?: string } = {}
 ): Promise<string> {
   if (!branchNameOverride) {
     return computeBranchName(sanitizedName, settings, username)
@@ -1217,7 +1256,10 @@ async function resolveCreateBranchName(
   if (branchNameOverride.startsWith('-')) {
     throw new Error('Branch name must not start with "-"')
   }
-  await gitExecFileAsync(['check-ref-format', '--branch', branchNameOverride], { cwd: repoPath })
+  await gitExecFileAsync(['check-ref-format', '--branch', branchNameOverride], {
+    cwd: repoPath,
+    ...gitOptions
+  })
   return branchNameOverride
 }
 
@@ -1254,14 +1296,16 @@ function addListenerToMap<T>(map: Map<string, Set<T>>, key: string, listener: T)
 async function canCheckoutExistingLocalBranch(
   repoPath: string,
   branchName: string,
-  baseBranch: string
+  baseBranch: string,
+  gitOptions: { wslDistro?: string } = {}
 ): Promise<boolean> {
   let localHead = ''
   try {
     const { stdout } = await gitExecFileAsync(
       ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}^{commit}`],
       {
-        cwd: repoPath
+        cwd: repoPath,
+        ...gitOptions
       }
     )
     localHead = stdout.trim()
@@ -1275,7 +1319,7 @@ async function canCheckoutExistingLocalBranch(
     try {
       const { stdout } = await gitExecFileAsync(
         ['rev-parse', '--verify', '--quiet', `${baseBranch}^{commit}`],
-        { cwd: repoPath }
+        { cwd: repoPath, ...gitOptions }
       )
       if (stdout.trim() !== localHead) {
         return false
@@ -1284,8 +1328,24 @@ async function canCheckoutExistingLocalBranch(
       return false
     }
   }
-  const worktrees = await listWorktrees(repoPath)
+  const worktrees = await listWorktrees(repoPath, gitOptions)
   return !worktrees.some((worktree) => normalizeLocalBranchName(worktree.branch) === branchName)
+}
+
+function hasLocalGitOptions(gitOptions: { wslDistro?: string }): boolean {
+  return Object.keys(gitOptions).length > 0
+}
+
+function getLocalGitHubPrForBranch(
+  repoPath: string,
+  branchName: string,
+  gitOptions: { wslDistro?: string }
+): ReturnType<typeof getPRForBranch> {
+  return hasLocalGitOptions(gitOptions)
+    ? getPRForBranch(repoPath, branchName, null, null, null, {
+        localGitExecOptions: gitOptions
+      })
+    : getPRForBranch(repoPath, branchName)
 }
 
 type SelectedReviewBranchInput = {
@@ -1379,7 +1439,8 @@ function getSelectedReviewLookupHints(args: SelectedReviewBranchInput): {
 async function getSelectedHostedReviewForBranch(
   repo: Pick<Repo, 'path' | 'connectionId'>,
   branchName: string,
-  args: SelectedReviewBranchInput
+  args: SelectedReviewBranchInput,
+  executionOptions: { localGitExecOptions?: { wslDistro?: string } } = {}
 ): Promise<{ matchesSelected: boolean; number: number } | null> {
   const selectedReview = getSelectedReviewBranch(args)
   if (!selectedReview) {
@@ -1389,6 +1450,7 @@ async function getSelectedHostedReviewForBranch(
     repoPath: repo.path,
     connectionId: repo.connectionId ?? null,
     branch: branchName,
+    ...executionOptions,
     ...getSelectedReviewLookupHints(args)
   })
   if (!review) {
@@ -1480,6 +1542,7 @@ type TerminalWorkspaceLaunchScope = {
   id: string
   path: string
   connectionId: string | null
+  repo: Repo | null
   folderWorkspace: FolderWorkspace | null
 }
 
@@ -2017,6 +2080,7 @@ export class OrcaRuntimeService {
     | 'defaultRepoSelection'
     | 'defaultLinearTeamSelection'
     | 'githubProjects'
+    | 'experimentalNewWorktreeCardStyle'
   > {
     if (!this.store?.getSettings) {
       throw new Error('runtime_unavailable')
@@ -2034,7 +2098,8 @@ export class OrcaRuntimeService {
       visibleTaskProviders: settings.visibleTaskProviders ?? [...TASK_PROVIDERS],
       defaultRepoSelection: settings.defaultRepoSelection ?? null,
       defaultLinearTeamSelection: settings.defaultLinearTeamSelection ?? null,
-      githubProjects: settings.githubProjects
+      githubProjects: settings.githubProjects,
+      experimentalNewWorktreeCardStyle: settings.experimentalNewWorktreeCardStyle === true
     }
   }
 
@@ -2052,6 +2117,7 @@ export class OrcaRuntimeService {
       | 'defaultRepoSelection'
       | 'defaultLinearTeamSelection'
       | 'githubProjects'
+      | 'experimentalNewWorktreeCardStyle'
     >
   ): Pick<
     GlobalSettings,
@@ -2067,6 +2133,7 @@ export class OrcaRuntimeService {
     | 'defaultRepoSelection'
     | 'defaultLinearTeamSelection'
     | 'githubProjects'
+    | 'experimentalNewWorktreeCardStyle'
   > {
     if (!this.store?.getSettings || !this.store.updateSettings) {
       throw new Error('runtime_unavailable')
@@ -3100,6 +3167,7 @@ export class OrcaRuntimeService {
             true,
             undefined,
             undefined,
+            undefined,
             {
               tabId: tab.parentTabId,
               leafId: tab.leafId,
@@ -3667,13 +3735,19 @@ export class OrcaRuntimeService {
   getRuntimeGitRemoteCommitUrl: RuntimeGitCommands['getRuntimeGitRemoteCommitUrl'] =
     this.gitCommands.getRuntimeGitRemoteCommitUrl.bind(this.gitCommands)
 
-  private async resolveRuntimeGitTarget(
-    worktreeSelector: string
-  ): Promise<{ worktree: ResolvedWorktree; repo?: Repo; connectionId?: string }> {
+  private async resolveRuntimeGitTarget(worktreeSelector: string): Promise<{
+    worktree: ResolvedWorktree
+    repo?: Repo
+    connectionId?: string
+    localGitOptions?: { wslDistro?: string }
+  }> {
     const store = this.requireStore()
     const worktree = await this.resolveWorktreeSelector(worktreeSelector)
     const repo = store.getRepo(worktree.repoId)
-    return { worktree, repo, connectionId: repo?.connectionId ?? undefined }
+    const connectionId = repo?.connectionId ?? undefined
+    const localGitOptions =
+      repo && !connectionId ? getLocalProjectWorktreeGitOptions(store, repo) : {}
+    return { worktree, repo, connectionId, localGitOptions }
   }
 
   onMobileSessionTabsChanged(
@@ -4102,6 +4176,16 @@ export class OrcaRuntimeService {
 
   getTerminalSize(ptyId: string): { cols: number; rows: number } | null {
     return this.ptyController?.getSize?.(ptyId) ?? null
+  }
+
+  // Why: a width reflow on a normal-buffer PTY must re-stream the full
+  // scrollback to mobile so it rewraps at the new cols, but alternate-screen
+  // TUIs (vim, Claude Code) own their repaint and have no scrollback — for
+  // those the mobile client just resizes xterm geometry and consumes the
+  // TUI's own redraw, so the resize re-stream must be skipped. Returns false
+  // when there is no headless emulator (resize falls back to geometry-only).
+  isTerminalAlternateScreen(ptyId: string): boolean {
+    return this.headlessTerminals.get(ptyId)?.emulator.isAlternateScreen ?? false
   }
 
   // Why: daemon-backed PTYs that the runtime adopted after an Orca relaunch
@@ -5364,11 +5448,11 @@ export class OrcaRuntimeService {
     ptyId: string,
     clientId: string,
     viewport: { cols: number; rows: number }
-  ): Promise<boolean> {
+  ): Promise<{ updated: boolean; applied: boolean }> {
     const inner = this.mobileSubscribers.get(ptyId)
     const sub = inner?.get(clientId)
     if (!sub) {
-      return false
+      return { updated: false, applied: false }
     }
     sub.viewport = viewport
     sub.lastActedAt = Date.now()
@@ -5376,12 +5460,12 @@ export class OrcaRuntimeService {
     const mode = this.getMobileDisplayMode(ptyId)
     if (mode === 'desktop') {
       // Watching at desktop dims — viewport is informational only.
-      return true
+      return { updated: true, applied: false }
     }
     // Drive PTY dims by the most-recent-actor (just updated to this client).
     const winner = this.pickMostRecentActor(inner!)
     if (!winner) {
-      return false
+      return { updated: false, applied: false }
     }
     const winnerSub = inner!.get(winner.clientId)
     const driveViewport = winnerSub?.viewport ?? viewport
@@ -5399,8 +5483,9 @@ export class OrcaRuntimeService {
     if (needsFreshSubscribeGuard) {
       this.freshSubscribeGuard.add(ptyId)
     }
+    let result: ApplyLayoutResult
     try {
-      await this.enqueueLayout(ptyId, {
+      result = await this.enqueueLayout(ptyId, {
         kind: 'phone',
         cols: clampedCols,
         rows: clampedRows,
@@ -5411,7 +5496,7 @@ export class OrcaRuntimeService {
         this.freshSubscribeGuard.delete(ptyId)
       }
     }
-    return true
+    return { updated: true, applied: result.ok }
   }
 
   // Why: remote desktop clients do not have the local `pty:resize` IPC path.
@@ -6959,9 +7044,14 @@ export class OrcaRuntimeService {
       const repo = repoById.get(worktree.repoId)
       let linkedPR: { number: number; state: string } | null = null
       const branch = worktree.branch.replace(/^refs\/heads\//, '')
-      if (repo?.path && branch && ghCache) {
-        const prCacheKey = `${repo.path}::${branch}`
-        const cached = ghCache.pr[prCacheKey]
+      if (branch && ghCache) {
+        // Why: the renderer keys the PR cache by `repoId::branch` (getGitHubPRCacheKey
+        // prefers repo.id over repo.path), so read by id first and fall back to path
+        // for legacy/path-keyed entries. Reading only by path missed every cached
+        // entry, leaving mobile's linked-PR badge stuck on the 'unknown' fallback.
+        const cached =
+          (repo?.id ? ghCache.pr[`${repo.id}::${branch}`] : undefined) ??
+          (repo?.path ? ghCache.pr[`${repo.path}::${branch}`] : undefined)
         if (cached?.data) {
           linkedPR = { number: cached.data.number, state: cached.data.state }
         }
@@ -6970,6 +7060,7 @@ export class OrcaRuntimeService {
         linkedPR = { number: meta.linkedPR, state: 'unknown' }
       }
       summaries.set(worktree.id, {
+        workspaceKind: 'git',
         worktreeId: worktree.id,
         repoId: worktree.repoId,
         repo: repo?.displayName ?? worktree.repoId,
@@ -6987,6 +7078,43 @@ export class OrcaRuntimeService {
         isPinned: meta?.isPinned ?? false,
         isActive: false,
         unread: meta?.isUnread ?? false,
+        liveTerminalCount: 0,
+        hasAttachedPty: false,
+        lastOutputAt: null,
+        preview: '',
+        status: 'inactive',
+        agents: []
+      })
+    }
+
+    const projectGroupById = new Map(
+      (this.store?.getProjectGroups?.() ?? []).map((group) => [group.id, group])
+    )
+    for (const folderWorkspace of this.store?.getFolderWorkspaces?.() ?? []) {
+      const projectGroup = projectGroupById.get(folderWorkspace.projectGroupId)
+      if (!projectGroup?.parentPath) {
+        continue
+      }
+      const worktree = folderWorkspaceToWorktree(folderWorkspace)
+      summaries.set(worktree.id, {
+        workspaceKind: 'folder-workspace',
+        worktreeId: worktree.id,
+        repoId: worktree.repoId,
+        repo: projectGroup.name,
+        path: worktree.path,
+        branch: worktree.branch,
+        parentWorktreeId: null,
+        childWorktreeIds: [],
+        displayName: worktree.displayName,
+        linkedIssue: worktree.linkedIssue ?? null,
+        linkedPR: null,
+        linkedLinearIssue: worktree.linkedLinearIssue ?? null,
+        linkedGitLabMR: worktree.linkedGitLabMR ?? null,
+        linkedGitLabIssue: worktree.linkedGitLabIssue ?? null,
+        comment: worktree.comment,
+        isPinned: worktree.isPinned,
+        isActive: false,
+        unread: worktree.isUnread,
         liveTerminalCount: 0,
         hasAttachedPty: false,
         lastOutputAt: null,
@@ -7197,6 +7325,19 @@ export class OrcaRuntimeService {
 
   listProjects(): Project[] {
     return this.store?.getProjects?.() ?? []
+  }
+
+  updateProject(projectId: string, updates: ProjectUpdateArgs['updates']): Project {
+    if (!this.store?.updateProject) {
+      throw new Error('runtime_unavailable')
+    }
+    const project = this.store.updateProject(projectId, updates)
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`)
+    }
+    this.invalidateResolvedWorktreeCache()
+    this.notifyReposChanged()
+    return project
   }
 
   listProjectHostSetups(): ProjectHostSetup[] {
@@ -8194,14 +8335,51 @@ export class OrcaRuntimeService {
     return { repo, repoPath: worktree.path }
   }
 
+  private getHostedReviewExecutionOptions(
+    repo: Repo
+  ): { localGitExecOptions: { wslDistro?: string } } | undefined {
+    const localGitOptions = this.getLocalGitExecutionOptionArgs(repo)[0] ?? {}
+    return Object.keys(localGitOptions).length > 0
+      ? { localGitExecOptions: localGitOptions }
+      : undefined
+  }
+
+  private getLocalGitExecutionOptionArgs(repo: Repo): [] | [{ wslDistro?: string }] {
+    const localGitOptions = getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
+    return Object.keys(localGitOptions).length > 0 ? [localGitOptions] : []
+  }
+
+  private getAgentLaunchPlatformForRepo(repo: Repo): NodeJS.Platform {
+    const projectRuntime = repo.connectionId
+      ? undefined
+      : resolveLocalProjectRuntimeForRepo(this.requireStore(), repo)
+    return getAgentLaunchPlatformForRepo(repo, projectRuntime)
+  }
+
+  private getAgentLaunchPlatformForWorkspace(scope: TerminalWorkspaceLaunchScope): NodeJS.Platform {
+    if (scope.repo) {
+      return this.getAgentLaunchPlatformForRepo(scope.repo)
+    }
+    if (scope.connectionId) {
+      return isWindowsAbsolutePathLike(scope.path) ? 'win32' : 'linux'
+    }
+    return isWslUncPath(scope.path) ? 'linux' : process.platform
+  }
+
   async getRepoSlug(repoSelector: string): Promise<{ owner: string; repo: string } | null> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getRepoSlug(repo.path, repo.connectionId ?? null)
+    const options = this.getHostedReviewExecutionOptions(repo)
+    return options
+      ? getRepoSlug(repo.path, repo.connectionId ?? null, options)
+      : getRepoSlug(repo.path, repo.connectionId ?? null)
   }
 
   async getRepoUpstream(repoSelector: string): Promise<{ owner: string; repo: string } | null> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getRepoUpstream(repo.path, repo.connectionId ?? null)
+    const options = this.getHostedReviewExecutionOptions(repo)
+    return options
+      ? getRepoUpstream(repo.path, repo.connectionId ?? null, options)
+      : getRepoUpstream(repo.path, repo.connectionId ?? null)
   }
 
   // Why: repos added before fork detection existed have no stored `upstream`, so
@@ -8254,7 +8432,8 @@ export class OrcaRuntimeService {
       before,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      noCache
+      noCache,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8267,7 +8446,8 @@ export class OrcaRuntimeService {
       repo.path,
       limit,
       repo.issueSourcePreference,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
     return result.items
   }
@@ -8278,7 +8458,13 @@ export class OrcaRuntimeService {
     type?: 'issue' | 'pr'
   ): Promise<Awaited<ReturnType<typeof getWorkItem>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getWorkItem(repo.path, number, type, repo.connectionId ?? null)
+    return getWorkItem(
+      repo.path,
+      number,
+      type,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async getRepoWorkItemByOwnerRepo(
@@ -8288,7 +8474,14 @@ export class OrcaRuntimeService {
     type: 'issue' | 'pr'
   ): Promise<Awaited<ReturnType<typeof getWorkItemByOwnerRepo>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getWorkItemByOwnerRepo(repo.path, ownerRepo, number, type, repo.connectionId ?? null)
+    return getWorkItemByOwnerRepo(
+      repo.path,
+      ownerRepo,
+      number,
+      type,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async getRepoWorkItemDetails(
@@ -8297,24 +8490,46 @@ export class OrcaRuntimeService {
     type?: 'issue' | 'pr'
   ): Promise<Awaited<ReturnType<typeof getWorkItemDetails>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getWorkItemDetails(repo.path, number, type, repo.connectionId ?? null)
+    return getWorkItemDetails(
+      repo.path,
+      number,
+      type,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async countRepoWorkItems(repoSelector: string, query?: string): Promise<number> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return countWorkItems(repo.path, query, repo.issueSourcePreference, repo.connectionId ?? null)
+    return countWorkItems(
+      repo.path,
+      query,
+      repo.issueSourcePreference,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async listRepoLabels(repoSelector: string): Promise<Awaited<ReturnType<typeof listLabels>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return listLabels(repo.path, repo.issueSourcePreference, repo.connectionId ?? null)
+    return listLabels(
+      repo.path,
+      repo.issueSourcePreference,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async listRepoAssignableUsers(
     repoSelector: string
   ): Promise<Awaited<ReturnType<typeof listAssignableUsers>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return listAssignableUsers(repo.path, repo.issueSourcePreference, repo.connectionId ?? null)
+    return listAssignableUsers(
+      repo.path,
+      repo.issueSourcePreference,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   getGitHubRateLimit(options?: {
@@ -8330,12 +8545,14 @@ export class OrcaRuntimeService {
     fallbackPRNumber?: number | null
   ): Promise<Awaited<ReturnType<typeof getPRForBranch>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
+    const options = this.getHostedReviewExecutionOptions(repo)
     return getPRForBranch(
       repo.path,
       branch,
       linkedPRNumber ?? null,
       repo.connectionId ?? null,
-      linkedPRNumber == null ? (fallbackPRNumber ?? null) : null
+      linkedPRNumber == null ? (fallbackPRNumber ?? null) : null,
+      options
     )
   }
 
@@ -8350,6 +8567,7 @@ export class OrcaRuntimeService {
     linkedGiteaPR?: number | null
   }): Promise<HostedReviewInfo | null> {
     const repo = await this.resolveRepoSelector(args.repoSelector)
+    const executionOptions = this.getHostedReviewExecutionOptions(repo)
     const review = await getHostedReviewForBranchFromRepo({
       repoPath: repo.path,
       connectionId: repo.connectionId ?? null,
@@ -8359,7 +8577,8 @@ export class OrcaRuntimeService {
       linkedGitLabMR: args.linkedGitLabMR ?? null,
       linkedBitbucketPR: args.linkedBitbucketPR ?? null,
       linkedAzureDevOpsPR: args.linkedAzureDevOpsPR ?? null,
-      linkedGiteaPR: args.linkedGiteaPR ?? null
+      linkedGiteaPR: args.linkedGiteaPR ?? null,
+      ...executionOptions
     })
     if (review?.provider === 'github' && this.stats && !this.stats.hasCountedPR(review.url)) {
       this.stats.record({
@@ -8379,6 +8598,7 @@ export class OrcaRuntimeService {
     }
   ): Promise<HostedReviewCreationEligibility> {
     const { repo, repoPath } = await this.resolveHostedReviewTarget(args)
+    const executionOptions = this.getHostedReviewExecutionOptions(repo)
     return getHostedReviewCreationEligibilityFromRepo({
       repoPath,
       connectionId: repo.connectionId ?? null,
@@ -8393,7 +8613,8 @@ export class OrcaRuntimeService {
       linkedGitLabMR: args.linkedGitLabMR ?? null,
       linkedBitbucketPR: args.linkedBitbucketPR ?? null,
       linkedAzureDevOpsPR: args.linkedAzureDevOpsPR ?? null,
-      linkedGiteaPR: args.linkedGiteaPR ?? null
+      linkedGiteaPR: args.linkedGiteaPR ?? null,
+      ...executionOptions
     })
   }
 
@@ -8401,19 +8622,24 @@ export class OrcaRuntimeService {
     args: CreateHostedReviewInput & { repoSelector: string; worktreeSelector?: string }
   ): Promise<CreateHostedReviewResult> {
     const { repo, repoPath } = await this.resolveHostedReviewTarget(args)
-    const result = await createHostedReviewFromRepo(
-      repoPath,
-      {
-        provider: args.provider,
-        base: args.base,
-        head: args.head,
-        title: args.title,
-        body: args.body,
-        draft: args.draft,
-        useTemplate: args.useTemplate
-      },
-      repo.connectionId ?? null
-    )
+    const executionOptions = this.getHostedReviewExecutionOptions(repo)
+    const input = {
+      provider: args.provider,
+      base: args.base,
+      head: args.head,
+      title: args.title,
+      body: args.body,
+      draft: args.draft,
+      ...(args.useTemplate !== undefined ? { useTemplate: args.useTemplate } : {})
+    }
+    const result = executionOptions
+      ? await createHostedReviewFromRepo(
+          repoPath,
+          input,
+          repo.connectionId ?? null,
+          executionOptions
+        )
+      : await createHostedReviewFromRepo(repoPath, input, repo.connectionId ?? null)
     if (result.ok && this.stats && !this.stats.hasCountedPR(result.url)) {
       this.stats.record({
         type: 'pr_created',
@@ -8440,7 +8666,8 @@ export class OrcaRuntimeService {
       perPage ?? 20,
       repo.issueSourcePreference,
       query,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8459,7 +8686,8 @@ export class OrcaRuntimeService {
       normalizeGitLabPositiveInteger(perPage, 20, 100),
       repo.issueSourcePreference,
       query,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8480,7 +8708,8 @@ export class OrcaRuntimeService {
       repo.issueSourcePreference,
       normalized.state,
       normalized.assignee,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
     // Why: web runtime mirrors the desktop preload contract, where GitLab
     // issue rows share the GitLabWorkItem shape with MRs on TaskPage.
@@ -8503,7 +8732,11 @@ export class OrcaRuntimeService {
     repoSelector: string
   ): Promise<Awaited<ReturnType<typeof listGitLabTodos>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return listGitLabTodos(repo.path, repo.connectionId ?? null)
+    return listGitLabTodos(
+      repo.path,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async diagnoseGitLabAuth(): Promise<Awaited<ReturnType<typeof diagnoseGitLabAuthClient>>> {
@@ -8521,7 +8754,12 @@ export class OrcaRuntimeService {
     repoSelector: string
   ): Promise<Awaited<ReturnType<typeof listGitLabLabels>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return listGitLabLabels(repo.path, repo.issueSourcePreference, repo.connectionId ?? null)
+    return listGitLabLabels(
+      repo.path,
+      repo.issueSourcePreference,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async createGitLabRepoIssue(
@@ -8535,7 +8773,8 @@ export class OrcaRuntimeService {
       title,
       body,
       repo.issueSourcePreference,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8552,7 +8791,8 @@ export class OrcaRuntimeService {
       updates,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8569,7 +8809,8 @@ export class OrcaRuntimeService {
       body,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8586,7 +8827,8 @@ export class OrcaRuntimeService {
       body,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8603,7 +8845,8 @@ export class OrcaRuntimeService {
       input,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8622,7 +8865,8 @@ export class OrcaRuntimeService {
       resolved,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8637,7 +8881,8 @@ export class OrcaRuntimeService {
       jobId,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8652,7 +8897,8 @@ export class OrcaRuntimeService {
       jobId,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8669,7 +8915,8 @@ export class OrcaRuntimeService {
       method ?? 'merge',
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8686,14 +8933,16 @@ export class OrcaRuntimeService {
           iid,
           repo.issueSourcePreference,
           repo.connectionId ?? null,
-          projectRef
+          projectRef,
+          ...this.getLocalGitExecutionOptionArgs(repo)
         )
       : reopenGitLabMR(
           repo.path,
           iid,
           repo.issueSourcePreference,
           repo.connectionId ?? null,
-          projectRef
+          projectRef,
+          ...this.getLocalGitExecutionOptionArgs(repo)
         )
   }
 
@@ -8710,7 +8959,8 @@ export class OrcaRuntimeService {
       updates,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8727,7 +8977,8 @@ export class OrcaRuntimeService {
       reviewerIds,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8744,7 +8995,8 @@ export class OrcaRuntimeService {
       type,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      projectRef
+      projectRef,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8760,7 +9012,8 @@ export class OrcaRuntimeService {
       projectRef,
       iid,
       type,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
     // Why: remote pasted-URL lookups should update GitLab recents exactly
     // like the desktop IPC path, but only after a successful lookup.
@@ -8783,7 +9036,12 @@ export class OrcaRuntimeService {
     number: number
   ): Promise<Awaited<ReturnType<typeof getIssue>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return getIssue(repo.path, number, repo.connectionId ?? null)
+    return getIssue(
+      repo.path,
+      number,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async getRepoPRChecks(
@@ -8800,7 +9058,8 @@ export class OrcaRuntimeService {
       headSha,
       prRepo ?? null,
       options,
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8810,7 +9069,13 @@ export class OrcaRuntimeService {
     options?: { headSha?: string; failedOnly?: boolean }
   ): Promise<Awaited<ReturnType<typeof rerunPRChecks>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return rerunPRChecks(repo.path, prNumber, options, repo.connectionId ?? null)
+    return rerunPRChecks(
+      repo.path,
+      prNumber,
+      options,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async getRepoPRCheckDetails(
@@ -8827,7 +9092,8 @@ export class OrcaRuntimeService {
     return getPRCheckDetails(
       repo.path,
       { ...args, prRepo: args.prRepo ?? null },
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8842,7 +9108,8 @@ export class OrcaRuntimeService {
       repo.path,
       prNumber,
       { ...options, prRepo: prRepo ?? null },
-      repo.connectionId ?? null
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8861,6 +9128,7 @@ export class OrcaRuntimeService {
     return getPRFileContents({
       repoPath: repo.path,
       connectionId: repo.connectionId ?? null,
+      localGitOptions: this.getLocalGitExecutionOptionArgs(repo)[0],
       ...args
     })
   }
@@ -8871,7 +9139,13 @@ export class OrcaRuntimeService {
     resolve: boolean
   ): Promise<Awaited<ReturnType<typeof resolveReviewThread>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return resolveReviewThread(repo.path, threadId, resolve, repo.connectionId ?? null)
+    return resolveReviewThread(
+      repo.path,
+      threadId,
+      resolve,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async setRepoPRFileViewed(
@@ -8886,6 +9160,7 @@ export class OrcaRuntimeService {
     return setPRFileViewed({
       repoPath: repo.path,
       connectionId: repo.connectionId ?? null,
+      localGitOptions: this.getLocalGitExecutionOptionArgs(repo)[0],
       ...args
     })
   }
@@ -8897,7 +9172,14 @@ export class OrcaRuntimeService {
     prRepo?: GitHubOwnerRepo | null
   ): Promise<Awaited<ReturnType<typeof updatePRTitle>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return updatePRTitle(repo.path, prNumber, title, repo.connectionId ?? null, prRepo ?? null)
+    return updatePRTitle(
+      repo.path,
+      prNumber,
+      title,
+      repo.connectionId ?? null,
+      prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async updateRepoPRDetails(
@@ -8907,7 +9189,14 @@ export class OrcaRuntimeService {
     prRepo?: GitHubOwnerRepo | null
   ): Promise<Awaited<ReturnType<typeof updatePRDetails>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return updatePRDetails(repo.path, prNumber, updates, repo.connectionId ?? null, prRepo ?? null)
+    return updatePRDetails(
+      repo.path,
+      prNumber,
+      updates,
+      repo.connectionId ?? null,
+      prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async mergeRepoPR(
@@ -8917,7 +9206,14 @@ export class OrcaRuntimeService {
     prRepo?: GitHubOwnerRepo | null
   ): Promise<Awaited<ReturnType<typeof mergePR>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return mergePR(repo.path, prNumber, method, repo.connectionId ?? null, prRepo ?? null)
+    return mergePR(
+      repo.path,
+      prNumber,
+      method,
+      repo.connectionId ?? null,
+      prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async setRepoPRAutoMerge(
@@ -8934,7 +9230,8 @@ export class OrcaRuntimeService {
       enabled,
       method,
       repo.connectionId ?? null,
-      prRepo ?? null
+      prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8944,7 +9241,13 @@ export class OrcaRuntimeService {
     updates: GitHubPullRequestStateUpdate
   ): Promise<Awaited<ReturnType<typeof updatePRState>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return updatePRState(repo.path, prNumber, updates, repo.connectionId ?? null)
+    return updatePRState(
+      repo.path,
+      prNumber,
+      updates,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async requestRepoPRReviewers(
@@ -8953,7 +9256,13 @@ export class OrcaRuntimeService {
     reviewers: string[]
   ): Promise<Awaited<ReturnType<typeof requestPRReviewers>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return requestPRReviewers(repo.path, prNumber, reviewers, repo.connectionId ?? null)
+    return requestPRReviewers(
+      repo.path,
+      prNumber,
+      reviewers,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async removeRepoPRReviewers(
@@ -8962,8 +9271,13 @@ export class OrcaRuntimeService {
     reviewers: string[]
   ): Promise<Awaited<ReturnType<typeof removePRReviewers>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    this.assertHostIntegrationRepoIsLocal(repo, 'repo_pr_reviewers')
-    return removePRReviewers(repo.path, prNumber, reviewers)
+    return removePRReviewers(
+      repo.path,
+      prNumber,
+      reviewers,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async createRepoIssue(
@@ -8979,7 +9293,8 @@ export class OrcaRuntimeService {
       body,
       repo.issueSourcePreference,
       repo.connectionId ?? null,
-      fields
+      fields,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -8989,7 +9304,13 @@ export class OrcaRuntimeService {
     updates: GitHubIssueUpdate
   ): Promise<Awaited<ReturnType<typeof updateIssue>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return updateIssue(repo.path, number, updates, repo.connectionId ?? null)
+    return updateIssue(
+      repo.path,
+      number,
+      updates,
+      repo.connectionId ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async addRepoIssueComment(
@@ -8999,7 +9320,14 @@ export class OrcaRuntimeService {
     prRepo?: GitHubOwnerRepo | null
   ): Promise<Awaited<ReturnType<typeof addIssueComment>>> {
     const repo = await this.resolveRepoSelector(repoSelector)
-    return addIssueComment(repo.path, number, body, repo.connectionId ?? null, prRepo ?? null)
+    return addIssueComment(
+      repo.path,
+      number,
+      body,
+      repo.connectionId ?? null,
+      prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
+    )
   }
 
   async addRepoPRReviewComment(
@@ -9010,6 +9338,7 @@ export class OrcaRuntimeService {
     return addPRReviewComment({
       repoPath: repo.path,
       connectionId: repo.connectionId ?? null,
+      localGitOptions: this.getLocalGitExecutionOptionArgs(repo)[0],
       ...args
     })
   }
@@ -9036,7 +9365,8 @@ export class OrcaRuntimeService {
       args.path,
       args.line,
       repo.connectionId ?? null,
-      args.prRepo ?? null
+      args.prRepo ?? null,
+      ...this.getLocalGitExecutionOptionArgs(repo)
     )
   }
 
@@ -9592,7 +9922,7 @@ export class OrcaRuntimeService {
 
     // Why: a mobile client can run on Windows while the workspace shell is
     // Linux over SSH. Startup command quoting must target the shell that runs it.
-    const agentLaunchPlatform = getAgentLaunchPlatformForRepo(repo)
+    const agentLaunchPlatform = this.getAgentLaunchPlatformForRepo(repo)
     const draftLaunchPlan = buildAgentDraftLaunchPlan({
       agent,
       draft: content,
@@ -9606,6 +9936,9 @@ export class OrcaRuntimeService {
         agent,
         startup: {
           command: draftLaunchPlan.launchCommand,
+          ...(draftLaunchPlan.startupCommandDelivery
+            ? { startupCommandDelivery: draftLaunchPlan.startupCommandDelivery }
+            : {}),
           ...(draftLaunchPlan.env ? { env: draftLaunchPlan.env } : {})
         }
       }
@@ -9627,6 +9960,9 @@ export class OrcaRuntimeService {
       agent,
       startup: {
         command: startupPlan.launchCommand,
+        ...(startupPlan.startupCommandDelivery
+          ? { startupCommandDelivery: startupPlan.startupCommandDelivery }
+          : {}),
         ...(startupPlan.env ? { env: startupPlan.env } : {})
       },
       draftPaste: { agent, content }
@@ -9647,7 +9983,7 @@ export class OrcaRuntimeService {
     }
     // Why: CLI clients may target SSH runtimes from macOS/Windows, so quote for
     // the workspace shell rather than the client shell.
-    const agentLaunchPlatform = getAgentLaunchPlatformForRepo(repo)
+    const agentLaunchPlatform = this.getAgentLaunchPlatformForRepo(repo)
     const startupPlan = buildAgentStartupPlan({
       agent,
       prompt: prompt ?? '',
@@ -9664,6 +10000,9 @@ export class OrcaRuntimeService {
       agent,
       startup: {
         command: startupPlan.launchCommand,
+        ...(startupPlan.startupCommandDelivery
+          ? { startupCommandDelivery: startupPlan.startupCommandDelivery }
+          : {}),
         ...(startupPlan.env ? { env: startupPlan.env } : {})
       },
       ...(startupPlan.followupPrompt
@@ -9982,6 +10321,7 @@ export class OrcaRuntimeService {
     startupAgent?: TuiAgent
     startupPrompt?: string
     pendingFirstAgentMessageRename?: boolean
+    automationProvenance?: AutomationWorkspaceProvenance
     startup?: WorktreeStartupLaunch
     startupDraft?: string
     startupDraftPaste?: WorktreeStartupDraftPaste
@@ -10041,6 +10381,7 @@ export class OrcaRuntimeService {
           path: settings.workspaceDir,
           nestWorkspaces: settings.nestWorkspaces
         },
+        ...(args.automationProvenance ? { automationProvenance: args.automationProvenance } : {}),
         ...(args.linkedIssue !== undefined ? { linkedIssue: args.linkedIssue } : {}),
         ...(args.linkedPR !== undefined ? { linkedPR: args.linkedPR } : {}),
         ...(args.linkedLinearIssue !== undefined
@@ -10083,6 +10424,7 @@ export class OrcaRuntimeService {
           const terminal = await this.createTerminal(`id:${worktree.id}`, {
             command: effectiveStartup.command,
             env: effectiveStartup.env,
+            startupCommandDelivery: effectiveStartup.startupCommandDelivery,
             telemetry: effectiveStartup.telemetry
           })
           if (effectiveDraftPaste) {
@@ -10165,6 +10507,19 @@ export class OrcaRuntimeService {
     }
     const settings = createSettings
     const worktreePathSettings = getWorktreePathSettings(repo, settings)
+    const localGitExecOptions = getLocalProjectGitExecOptions(this.requireStore(), repo)
+    const localWorktreeGitOptions = getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
+    const hasLocalWorktreeGitOptions = hasLocalGitOptions(localWorktreeGitOptions)
+    const localWorktreeGitOptionArgs: [] | [{ wslDistro?: string }] = hasLocalWorktreeGitOptions
+      ? [localWorktreeGitOptions]
+      : []
+    const addProjectGitOptions = (options?: AddWorktreeOptions): AddWorktreeOptions | undefined => {
+      if (!hasLocalWorktreeGitOptions) {
+        return options
+      }
+      return { ...options, ...localWorktreeGitOptions }
+    }
+    const hostedReviewExecutionContext = this.getHostedReviewExecutionOptions(repo)
     let effectiveRequestedName = args.name
     const requestedDisplayName = args.displayName?.trim() || undefined
     const sanitizedName = sanitizeWorktreeName(args.name)
@@ -10175,10 +10530,16 @@ export class OrcaRuntimeService {
       args.branchNameOverride,
       sanitizedName,
       settings,
-      username
+      username,
+      localWorktreeGitOptions
     )
 
-    const baseBranch = args.baseBranch || repo.worktreeBaseRef || getDefaultBaseRef(repo.path)
+    const baseBranch =
+      args.baseBranch ||
+      repo.worktreeBaseRef ||
+      (hasLocalWorktreeGitOptions
+        ? await resolveDefaultBaseRefViaExec((argv) => gitExecFileAsync(argv, localGitExecOptions))
+        : getDefaultBaseRef(repo.path))
     if (!baseBranch) {
       // Why: getDefaultBaseRef returns null when no suitable ref exists.
       // Don't fabricate 'origin/main' — passing it to addWorktree would
@@ -10192,11 +10553,17 @@ export class OrcaRuntimeService {
     const checkoutExistingBranch = await canCheckoutExistingLocalBranch(
       repo.path,
       branchName,
-      baseBranch
+      baseBranch,
+      ...localWorktreeGitOptionArgs
     )
     let branchConflictKind = checkoutExistingBranch
       ? null
-      : await getBranchConflictKind(repo.path, branchName, baseBranch)
+      : await getBranchConflictKind(
+          repo.path,
+          branchName,
+          baseBranch,
+          ...localWorktreeGitOptionArgs
+        )
     const allowedPushTargetRemoteConflict =
       branchConflictKind && isAllowedPushTargetRemoteConflict(branchConflictKind, branchName, args)
     if (branchConflictKind && !allowedPushTargetRemoteConflict) {
@@ -10210,7 +10577,11 @@ export class OrcaRuntimeService {
       const selectedReview = getSelectedReviewBranch(args)
       if (selectedReview?.provider === 'github' || !allowedPushTargetRemoteConflict) {
         try {
-          existingPR = await getPRForBranch(repo.path, branchName)
+          existingPR = await getLocalGitHubPrForBranch(
+            repo.path,
+            branchName,
+            localWorktreeGitOptions
+          )
         } catch {
           if (allowedPushTargetRemoteConflict) {
             throw new Error(`Could not verify selected PR branch "${branchName}". Try again.`)
@@ -10229,9 +10600,12 @@ export class OrcaRuntimeService {
             throw new Error(`Branch "${branchName}" already exists on a remote.`)
           }
         } else if (selectedReview) {
-          const hostedReview = await getSelectedHostedReviewForBranch(repo, branchName, args).catch(
-            () => null
-          )
+          const hostedReview = await getSelectedHostedReviewForBranch(
+            repo,
+            branchName,
+            args,
+            hostedReviewExecutionContext
+          ).catch(() => null)
           if (!hostedReview?.matchesSelected) {
             if (hostedReview) {
               throw new Error(`Branch "${branchName}" already has PR #${hostedReview.number}.`)
@@ -10273,19 +10647,35 @@ export class OrcaRuntimeService {
         `Could not find an available worktree path for "${sanitizedName}". Pick a different worktree name.`
       )
     }
-    const remoteTrackingBase = await this.resolveRemoteTrackingBase(repo.path, baseBranch)
+    const remoteTrackingBase = await this.resolveRemoteTrackingBase(
+      repo.path,
+      baseBranch,
+      ...localWorktreeGitOptionArgs
+    )
     if (remoteTrackingBase) {
-      const hadLocalBaseRef = await this.hasRemoteTrackingRef(repo.path, remoteTrackingBase)
+      const hadLocalBaseRef = await this.hasRemoteTrackingRef(
+        repo.path,
+        remoteTrackingBase,
+        ...localWorktreeGitOptionArgs
+      )
       const refreshResult = await this.getOrStartRemoteTrackingBaseRefresh(
         repo.path,
-        remoteTrackingBase
+        remoteTrackingBase,
+        ...localWorktreeGitOptionArgs
       )
       if (!refreshResult.ok) {
         throw new Error(
           `Could not refresh base ref "${baseBranch}" from "${remoteTrackingBase.remote}". Check your network and try again.`
         )
       }
-      if (!hadLocalBaseRef && !(await this.hasRemoteTrackingRef(repo.path, remoteTrackingBase))) {
+      if (
+        !hadLocalBaseRef &&
+        !(await this.hasRemoteTrackingRef(
+          repo.path,
+          remoteTrackingBase,
+          ...localWorktreeGitOptionArgs
+        ))
+      ) {
         throw new Error(`Base ref "${baseBranch}" was not found after fetching.`)
       }
     } else if (!(await hasLocalCommitObject(repo.path, baseBranch))) {
@@ -10293,7 +10683,7 @@ export class OrcaRuntimeService {
       // Why: local bases keep legacy best-effort fetch behavior. Verified PR
       // SHA bases already have the commit object needed by `git worktree add`.
       try {
-        await this.fetchRemoteWithCache(repo.path, remote)
+        await this.fetchRemoteWithCache(repo.path, remote, ...localWorktreeGitOptionArgs)
       } catch {
         // Why: belt-and-suspenders. fetchRemoteWithCache already logs and does
         // not throw; the outer try/catch guarantees create-path tolerance even
@@ -10317,7 +10707,8 @@ export class OrcaRuntimeService {
         repo.path,
         args.pushTarget,
         this.store,
-        repo.id
+        repo.id,
+        localWorktreeGitOptions
       )
     }
 
@@ -10331,6 +10722,7 @@ export class OrcaRuntimeService {
       ...remoteTrackingBaseOption,
       ...(suggestLocalBaseRefUpdate ? { suggestLocalBaseRefUpdate } : {})
     }
+    const defaultAddWorktreeOption = addProjectGitOptions()
     const addResult: AddWorktreeResult =
       (await (sparseDirectories.length > 0
         ? checkoutExistingBranch
@@ -10341,7 +10733,7 @@ export class OrcaRuntimeService {
               sparseDirectories,
               baseBranch,
               settings.refreshLocalBaseRefOnWorktreeCreate,
-              existingBranchOption
+              addProjectGitOptions(existingBranchOption)
             )
           : suggestLocalBaseRefUpdate
             ? addSparseWorktree(
@@ -10351,7 +10743,7 @@ export class OrcaRuntimeService {
                 sparseDirectories,
                 baseBranch,
                 settings.refreshLocalBaseRefOnWorktreeCreate,
-                { ...remoteTrackingBaseOption, suggestLocalBaseRefUpdate }
+                addProjectGitOptions({ ...remoteTrackingBaseOption, suggestLocalBaseRefUpdate })
               )
             : remoteTrackingBaseOption
               ? addSparseWorktree(
@@ -10361,16 +10753,26 @@ export class OrcaRuntimeService {
                   sparseDirectories,
                   baseBranch,
                   settings.refreshLocalBaseRefOnWorktreeCreate,
-                  remoteTrackingBaseOption
+                  addProjectGitOptions(remoteTrackingBaseOption)
                 )
-              : addSparseWorktree(
-                  repo.path,
-                  worktreePath,
-                  branchName,
-                  sparseDirectories,
-                  baseBranch,
-                  settings.refreshLocalBaseRefOnWorktreeCreate
-                )
+              : defaultAddWorktreeOption
+                ? addSparseWorktree(
+                    repo.path,
+                    worktreePath,
+                    branchName,
+                    sparseDirectories,
+                    baseBranch,
+                    settings.refreshLocalBaseRefOnWorktreeCreate,
+                    defaultAddWorktreeOption
+                  )
+                : addSparseWorktree(
+                    repo.path,
+                    worktreePath,
+                    branchName,
+                    sparseDirectories,
+                    baseBranch,
+                    settings.refreshLocalBaseRefOnWorktreeCreate
+                  )
         : checkoutExistingBranch
           ? addWorktree(
               repo.path,
@@ -10379,7 +10781,7 @@ export class OrcaRuntimeService {
               baseBranch,
               settings.refreshLocalBaseRefOnWorktreeCreate,
               false,
-              existingBranchOption
+              addProjectGitOptions(existingBranchOption)
             )
           : suggestLocalBaseRefUpdate
             ? addWorktree(
@@ -10389,7 +10791,7 @@ export class OrcaRuntimeService {
                 baseBranch,
                 settings.refreshLocalBaseRefOnWorktreeCreate,
                 false,
-                { ...remoteTrackingBaseOption, suggestLocalBaseRefUpdate }
+                addProjectGitOptions({ ...remoteTrackingBaseOption, suggestLocalBaseRefUpdate })
               )
             : remoteTrackingBaseOption
               ? addWorktree(
@@ -10399,26 +10801,39 @@ export class OrcaRuntimeService {
                   baseBranch,
                   settings.refreshLocalBaseRefOnWorktreeCreate,
                   false,
-                  remoteTrackingBaseOption
+                  addProjectGitOptions(remoteTrackingBaseOption)
                 )
-              : addWorktree(
-                  repo.path,
-                  worktreePath,
-                  branchName,
-                  baseBranch,
-                  settings.refreshLocalBaseRefOnWorktreeCreate
-                ))) ?? {}
+              : defaultAddWorktreeOption
+                ? addWorktree(
+                    repo.path,
+                    worktreePath,
+                    branchName,
+                    baseBranch,
+                    settings.refreshLocalBaseRefOnWorktreeCreate,
+                    false,
+                    defaultAddWorktreeOption
+                  )
+                : addWorktree(
+                    repo.path,
+                    worktreePath,
+                    branchName,
+                    baseBranch,
+                    settings.refreshLocalBaseRefOnWorktreeCreate
+                  ))) ?? {}
 
     let configuredPushTarget: GitPushTarget | undefined
     if (preparedPushTarget) {
       configuredPushTarget = await configureCreatedWorktreePushTarget(
         worktreePath,
         branchName,
-        preparedPushTarget
+        preparedPushTarget,
+        localWorktreeGitOptions
       )
     }
 
-    const gitWorktrees = await listWorktrees(repo.path)
+    const gitWorktrees = hasLocalWorktreeGitOptions
+      ? await listWorktrees(repo.path, localWorktreeGitOptions)
+      : await listWorktrees(repo.path)
     const created = gitWorktrees.find((gw) => areWorktreePathsEqual(gw.path, worktreePath))
     if (!created) {
       throw new Error('Worktree created but not found in listing')
@@ -10486,6 +10901,7 @@ export class OrcaRuntimeService {
       ...(args.pendingFirstAgentMessageRename === true && effectiveCreatedWithAgent
         ? { pendingFirstAgentMessageRename: true }
         : {}),
+      ...(args.automationProvenance ? { automationProvenance: args.automationProvenance } : {}),
       ...(args.comment !== undefined ? { comment: args.comment } : {}),
       ...(args.manualOrder !== undefined ? { manualOrder: args.manualOrder } : {}),
       ...(args.workspaceStatus !== undefined ? { workspaceStatus: args.workspaceStatus } : {})
@@ -10502,7 +10918,7 @@ export class OrcaRuntimeService {
       repo.symlinkPaths &&
       repo.symlinkPaths.length > 0
     ) {
-      await createWorktreeSymlinks(repo.path, created.path, repo.symlinkPaths)
+      await createWorktreeLinkedPaths(repo.path, created.path, repo.symlinkPaths)
     }
 
     let setup: CreateWorktreeResult['setup']
@@ -10534,7 +10950,12 @@ export class OrcaRuntimeService {
           // renderer create flow so repo-committed `orca.yaml` setup hooks run in
           // the visible first terminal instead of a hidden background shell with
           // different failure and prompt behavior.
-          setup = createSetupRunnerScript(repo, worktreePath, hooks.scripts.setup)
+          setup = createSetupRunnerScript(
+            repo,
+            worktreePath,
+            hooks.scripts.setup,
+            this.getLocalGitExecutionOptionArgs(repo)[0]
+          )
         } catch (error) {
           // Why: the git worktree is already real at this point. If runner
           // generation fails, keep creation successful and surface the problem in
@@ -10542,7 +10963,13 @@ export class OrcaRuntimeService {
           console.error(`[hooks] Failed to prepare setup runner for ${worktreePath}:`, error)
         }
       } else {
-        void runHook('setup', worktreePath, repo, worktreePath).then((result) => {
+        void runHook(
+          'setup',
+          worktreePath,
+          repo,
+          worktreePath,
+          this.getLocalGitExecutionOptionArgs(repo)[0]
+        ).then((result) => {
           if (!result.success) {
             console.error(`[hooks] setup hook failed for ${worktreePath}:`, result.output)
           }
@@ -10580,6 +11007,7 @@ export class OrcaRuntimeService {
         const terminal = await this.createTerminal(`id:${worktree.id}`, {
           command: effectiveStartup.command,
           env: effectiveStartup.env,
+          startupCommandDelivery: effectiveStartup.startupCommandDelivery,
           telemetry: effectiveStartup.telemetry
         })
         if (effectiveDraftPaste) {
@@ -10753,6 +11181,7 @@ export class OrcaRuntimeService {
       setupDecision?: 'run' | 'skip' | 'inherit'
       createdWithAgent?: TuiAgent
       pendingFirstAgentMessageRename?: boolean
+      automationProvenance?: AutomationWorkspaceProvenance
       startup?: WorktreeStartupLaunch
       startupFollowup?: WorktreeStartupFollowup
       startupDraftPaste?: WorktreeStartupDraftPaste
@@ -10803,7 +11232,8 @@ export class OrcaRuntimeService {
         ...(args.createdWithAgent ? { createdWithAgent: args.createdWithAgent } : {}),
         ...(args.pendingFirstAgentMessageRename === true
           ? { pendingFirstAgentMessageRename: true }
-          : {})
+          : {}),
+        ...(args.automationProvenance ? { automationProvenance: args.automationProvenance } : {})
       },
       repo,
       this.store as unknown as Store,
@@ -10836,6 +11266,7 @@ export class OrcaRuntimeService {
         const terminal = await this.createTerminal(`path:${result.worktree.path}`, {
           command: args.startup.command,
           env: args.startup.env,
+          startupCommandDelivery: args.startup.startupCommandDelivery,
           telemetry: args.startup.telemetry
         })
         if (args.startupDraftPaste) {
@@ -10975,8 +11406,13 @@ export class OrcaRuntimeService {
    * primary telemetry target; splitting the cache by call-site would double
    * the fetch load on warm repos.
    */
-  async getCanonicalFetchKey(repoPath: string, remote: string): Promise<string> {
-    const cacheKey = `${repoPath}::${remote}`
+  async getCanonicalFetchKey(
+    repoPath: string,
+    remote: string,
+    gitOptions: { wslDistro?: string } = {}
+  ): Promise<string> {
+    const runtimeKey = gitOptions.wslDistro ? `wsl:${gitOptions.wslDistro}` : 'local'
+    const cacheKey = `${runtimeKey}::${repoPath}::${remote}`
     const cached = this.canonicalFetchKeyCache.get(cacheKey)
     if (cached !== undefined) {
       setBoundedMapEntry(this.canonicalFetchKeyCache, cacheKey, cached, REMOTE_FETCH_CACHE_MAX)
@@ -10986,11 +11422,11 @@ export class OrcaRuntimeService {
     try {
       const { stdout } = await gitExecFileAsync(
         ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-        { cwd: repoPath }
+        { cwd: repoPath, ...gitOptions }
       )
       const commonDir = stdout.trim()
       if (commonDir) {
-        resolved = `${commonDir}::${remote}`
+        resolved = `${runtimeKey}::${commonDir}::${remote}`
       }
     } catch {
       // Fall through to the caller-provided path. The fetch still runs from
@@ -11032,8 +11468,12 @@ export class OrcaRuntimeService {
     setBoundedMapEntry(this.fetchLastCompletedAt, key, completedAt, REMOTE_FETCH_CACHE_MAX)
   }
 
-  async getOrStartRemoteFetch(repoPath: string, remote: string): Promise<RemoteFetchResult> {
-    const key = await this.getCanonicalFetchKey(repoPath, remote)
+  async getOrStartRemoteFetch(
+    repoPath: string,
+    remote: string,
+    gitOptions: { wslDistro?: string } = {}
+  ): Promise<RemoteFetchResult> {
+    const key = await this.getCanonicalFetchKey(repoPath, remote, gitOptions)
     if (this.getFreshFetchCompletedAt(key) !== null) {
       // Why: freshness window hit — skip the fetch entirely. Do NOT reuse any
       // in-flight promise here; the timestamp is only written on success, so
@@ -11049,7 +11489,7 @@ export class OrcaRuntimeService {
     }
 
     const promise = this.enqueueRemoteFetch(key, () =>
-      gitExecFileAsync(['fetch', remote], { cwd: repoPath })
+      gitExecFileAsync(['fetch', remote], { cwd: repoPath, ...gitOptions })
         .then((): RemoteFetchResult => {
           // Why (§3.3 Lifecycle): timestamp on success ONLY. Writing on rejection
           // would make the freshness cache lie about the last known remote state.
@@ -11076,10 +11516,15 @@ export class OrcaRuntimeService {
 
   async getOrStartRemoteTrackingBaseRefresh(
     repoPath: string,
-    base: RemoteTrackingBase
+    base: RemoteTrackingBase,
+    gitOptions: { wslDistro?: string } = {}
   ): Promise<RemoteFetchResult> {
-    const remoteKey = await this.getCanonicalFetchKey(repoPath, base.remote)
-    const key = await this.getCanonicalFetchKey(repoPath, `base:${base.remote}:${base.branch}`)
+    const remoteKey = await this.getCanonicalFetchKey(repoPath, base.remote, gitOptions)
+    const key = await this.getCanonicalFetchKey(
+      repoPath,
+      `base:${base.remote}:${base.branch}`,
+      gitOptions
+    )
     if (this.getFreshFetchCompletedAt(key) !== null) {
       // Why: exact-base freshness is the safety boundary. A full remote fetch
       // can be narrowed by repo refspecs, so it must not prove this branch.
@@ -11097,7 +11542,7 @@ export class OrcaRuntimeService {
       }
       return gitExecFileAsync(
         ['fetch', '--no-tags', base.remote, `+refs/heads/${base.branch}:${base.ref}`],
-        { cwd: repoPath }
+        { cwd: repoPath, ...gitOptions }
       )
         .then((): RemoteFetchResult => {
           this.rememberFreshFetchCompletedAt(key)
@@ -11118,17 +11563,22 @@ export class OrcaRuntimeService {
     return promise
   }
 
-  async fetchRemoteWithCache(repoPath: string, remote: string): Promise<void> {
-    await this.getOrStartRemoteFetch(repoPath, remote)
+  async fetchRemoteWithCache(
+    repoPath: string,
+    remote: string,
+    gitOptions: { wslDistro?: string } = {}
+  ): Promise<void> {
+    await this.getOrStartRemoteFetch(repoPath, remote, gitOptions)
   }
 
   async resolveRemoteTrackingBase(
     repoPath: string,
-    baseBranch: string
+    baseBranch: string,
+    gitOptions: { wslDistro?: string } = {}
   ): Promise<RemoteTrackingBase | null> {
     let remotes: string[]
     try {
-      const { stdout } = await gitExecFileAsync(['remote'], { cwd: repoPath })
+      const { stdout } = await gitExecFileAsync(['remote'], { cwd: repoPath, ...gitOptions })
       remotes = stdout
         .split('\n')
         .map((line) => line.trim())
@@ -11159,9 +11609,16 @@ export class OrcaRuntimeService {
     }
   }
 
-  async hasRemoteTrackingRef(repoPath: string, base: RemoteTrackingBase): Promise<boolean> {
+  async hasRemoteTrackingRef(
+    repoPath: string,
+    base: RemoteTrackingBase,
+    gitOptions: { wslDistro?: string } = {}
+  ): Promise<boolean> {
     try {
-      await gitExecFileAsync(['rev-parse', '--verify', `${base.ref}^{commit}`], { cwd: repoPath })
+      await gitExecFileAsync(['rev-parse', '--verify', `${base.ref}^{commit}`], {
+        cwd: repoPath,
+        ...gitOptions
+      })
       return true
     } catch {
       return false
@@ -11352,28 +11809,43 @@ export class OrcaRuntimeService {
       // instead of probing a server path on the desktop filesystem.
       return null
     }
+    const localGitExecOptions = getLocalProjectGitExecOptions(this.requireStore(), repo)
+    const localWorktreeGitOptions = getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
     const meta = this.store.getWorktreeMeta(wt.id)
     const base =
-      meta?.baseRef || meta?.sparseBaseRef || repo.worktreeBaseRef || getDefaultBaseRef(repo.path)
+      meta?.baseRef ||
+      meta?.sparseBaseRef ||
+      repo.worktreeBaseRef ||
+      (await getBaseRefDefault(repo.path, localWorktreeGitOptions))
     if (!base) {
       // Why: brand-new repo with no remote primary — nothing to compare
       // against, so there's no meaningful drift to report. Dispatch should
       // not block on a probe that cannot form an opinion.
       return null
     }
-    const remoteTrackingBase = await this.resolveRemoteTrackingBase(repo.path, base)
+    const remoteTrackingBase = await this.resolveRemoteTrackingBase(
+      repo.path,
+      base,
+      localWorktreeGitOptions
+    )
     if (!remoteTrackingBase) {
       return null
     }
     const remote = remoteTrackingBase.remote
     // Why: fetch failures are non-fatal; we proceed with whatever the
     // last-known remote ref points at. `fetchRemoteWithCache` never throws.
-    await this.fetchRemoteWithCache(repo.path, remote)
-    const drift = getRemoteDrift(wt.path, 'HEAD', base)
+    await this.fetchRemoteWithCache(repo.path, remote, localWorktreeGitOptions)
+    const drift = getRemoteDrift(wt.path, 'HEAD', base, localGitExecOptions)
     if (!drift) {
       return null
     }
-    const recentSubjects = getRecentDriftSubjects(wt.path, 'HEAD', base, DRIFT_PROBE_SUBJECT_LIMIT)
+    const recentSubjects = getRecentDriftSubjects(
+      wt.path,
+      'HEAD',
+      base,
+      DRIFT_PROBE_SUBJECT_LIMIT,
+      localGitExecOptions
+    )
     return { base, behind: drift.behind, recentSubjects }
   }
 
@@ -11485,9 +11957,15 @@ export class OrcaRuntimeService {
       return { error: 'Folder mode does not support creating worktrees.' }
     }
     const sshGitProvider = repo.connectionId ? requireSshGitProvider(repo.connectionId) : null
+    const localGitExecOptions = sshGitProvider
+      ? undefined
+      : getLocalProjectGitExecOptions(this.requireStore(), repo)
+    const localWorktreeGitOptions = sshGitProvider
+      ? {}
+      : getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
     const gitExec = sshGitProvider
       ? (gitArgs: string[]) => sshGitProvider.exec(gitArgs, repo.path)
-      : (gitArgs: string[]) => gitExecFileAsync(gitArgs, { cwd: repo.path })
+      : (gitArgs: string[]) => gitExecFileAsync(gitArgs, localGitExecOptions ?? { cwd: repo.path })
     const resolveRemote = sshGitProvider
       ? async () => {
           const { stdout } = await sshGitProvider.exec(['remote'], repo.path)
@@ -11508,12 +11986,18 @@ export class OrcaRuntimeService {
             `Repo has multiple remotes (${remotes.join(', ')}) and no default is configured.`
           )
         }
-      : () => getDefaultRemote(repo.path)
+      : () => getDefaultRemote(repo.path, localWorktreeGitOptions)
 
     // Why: SSH repos can't fetch over the relay's read-only git.exec channel, so
     // route the PR head fetch through the write-capable helper instead of gitExec.
     const fetchRemoteTrackingRef = (remote: string, branch: string): Promise<void> =>
-      fetchPrHeadTrackingRef(repo, sshGitProvider, remote, branch)
+      fetchPrHeadTrackingRef(
+        repo,
+        sshGitProvider,
+        remote,
+        branch,
+        localGitExecOptions ? { localGitExecOptions } : {}
+      )
 
     return resolveGitHubPrStartPoint({
       repoPath: repo.path,
@@ -11522,6 +12006,7 @@ export class OrcaRuntimeService {
       baseRefName: args.baseRefName,
       isCrossRepository: args.isCrossRepository,
       connectionId: repo.connectionId ?? null,
+      localGitOptions: localWorktreeGitOptions,
       gitExec,
       fetchRemoteTrackingRef,
       resolveRemote
@@ -11550,9 +12035,15 @@ export class OrcaRuntimeService {
       return { error: 'Folder mode does not support creating worktrees.' }
     }
     const sshGitProvider = repo.connectionId ? requireSshGitProvider(repo.connectionId) : null
+    const localGitExecOptions = sshGitProvider
+      ? undefined
+      : getLocalProjectGitExecOptions(this.requireStore(), repo)
+    const localWorktreeGitOptions = sshGitProvider
+      ? {}
+      : getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
     const gitExec = sshGitProvider
       ? (gitArgs: string[]) => sshGitProvider.exec(gitArgs, repo.path)
-      : (gitArgs: string[]) => gitExecFileAsync(gitArgs, { cwd: repo.path })
+      : (gitArgs: string[]) => gitExecFileAsync(gitArgs, localGitExecOptions ?? { cwd: repo.path })
 
     let sourceBranch = args.sourceBranch?.trim() ?? ''
     let targetBranch = args.targetBranch?.trim() ?? ''
@@ -11564,7 +12055,8 @@ export class OrcaRuntimeService {
         remote = await this.resolveGitLabIssueSourceRemote(
           repo.path,
           repo.issueSourcePreference,
-          repo.connectionId ?? null
+          repo.connectionId ?? null,
+          localWorktreeGitOptions
         )
       } catch (error) {
         return { error: error instanceof Error ? error.message : 'Could not resolve git remote.' }
@@ -11574,7 +12066,8 @@ export class OrcaRuntimeService {
         repo.path,
         remote,
         knownHosts,
-        repo.connectionId ?? null
+        repo.connectionId ?? null,
+        localWorktreeGitOptions
       )
       if (!projectRef) {
         return { error: 'No GitLab project found for this repository.' }
@@ -11584,7 +12077,8 @@ export class OrcaRuntimeService {
         projectRef,
         args.mrIid,
         'mr',
-        repo.connectionId ?? null
+        repo.connectionId ?? null,
+        localWorktreeGitOptions
       )
       if (!item || item.type !== 'mr') {
         return { error: `MR !${args.mrIid} not found.` }
@@ -11604,7 +12098,8 @@ export class OrcaRuntimeService {
       remote = await this.resolveGitLabIssueSourceRemote(
         repo.path,
         repo.issueSourcePreference,
-        repo.connectionId ?? null
+        repo.connectionId ?? null,
+        localWorktreeGitOptions
       )
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Could not resolve git remote.' }
@@ -11684,15 +12179,19 @@ export class OrcaRuntimeService {
   private async resolveGitLabIssueSourceRemote(
     repoPath: string,
     preference?: Repo['issueSourcePreference'],
-    connectionId?: string | null
+    connectionId?: string | null,
+    localGitOptions: { wslDistro?: string } = {}
   ): Promise<string> {
     const knownHosts = await getGlabKnownHosts()
+    const localGitOptionArgs =
+      Object.keys(localGitOptions).length > 0 ? ([localGitOptions] as const) : []
     if (preference === 'origin') {
       const origin = await getGitLabProjectRefForRemote(
         repoPath,
         'origin',
         knownHosts,
-        connectionId
+        connectionId,
+        ...localGitOptionArgs
       )
       if (origin) {
         return 'origin'
@@ -11704,7 +12203,8 @@ export class OrcaRuntimeService {
         repoPath,
         'upstream',
         knownHosts,
-        connectionId
+        connectionId,
+        ...localGitOptionArgs
       )
       if (upstream) {
         return 'upstream'
@@ -11713,7 +12213,8 @@ export class OrcaRuntimeService {
         repoPath,
         'origin',
         knownHosts,
-        connectionId
+        connectionId,
+        ...localGitOptionArgs
       )
       if (origin) {
         return 'origin'
@@ -11724,12 +12225,19 @@ export class OrcaRuntimeService {
       repoPath,
       'upstream',
       knownHosts,
-      connectionId
+      connectionId,
+      ...localGitOptionArgs
     )
     if (upstream) {
       return 'upstream'
     }
-    const origin = await getGitLabProjectRefForRemote(repoPath, 'origin', knownHosts, connectionId)
+    const origin = await getGitLabProjectRefForRemote(
+      repoPath,
+      'origin',
+      knownHosts,
+      connectionId,
+      ...localGitOptionArgs
+    )
     if (origin) {
       return 'origin'
     }
@@ -11753,7 +12261,7 @@ export class OrcaRuntimeService {
         `Repo has multiple remotes (${remotes.join(', ')}) and no default is configured.`
       )
     }
-    return getDefaultRemote(repoPath)
+    return getDefaultRemote(repoPath, localGitOptions)
   }
 
   private async resolveWorktreeRemovalTarget(
@@ -11878,12 +12386,21 @@ export class OrcaRuntimeService {
         this.store
       )
     } else {
-      await forceDeleteLocalBranch(repo.path, cleanupTarget.branchName, cleanupTarget.head)
+      const localWorktreeGitOptions = getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
+      await (Object.keys(localWorktreeGitOptions).length > 0
+        ? forceDeleteLocalBranch(
+            repo.path,
+            cleanupTarget.branchName,
+            cleanupTarget.head,
+            (argv, cwd) => gitExecFileAsync(argv, { cwd, ...localWorktreeGitOptions })
+          )
+        : forceDeleteLocalBranch(repo.path, cleanupTarget.branchName, cleanupTarget.head))
       await cleanupUnusedWorktreePushTargetRemote(
         repo.path,
         removalTarget.id,
         cleanupTarget.pushTarget,
-        this.store
+        this.store,
+        localWorktreeGitOptions
       )
     }
 
@@ -11943,9 +12460,15 @@ export class OrcaRuntimeService {
       }
       const provider = repo.connectionId ? requireSshGitProvider(repo.connectionId) : null
       const fsProvider = repo.connectionId ? getSshFilesystemProvider(repo.connectionId) : null
+      const localWorktreeGitOptions = repo.connectionId
+        ? {}
+        : getLocalProjectWorktreeGitOptions(this.requireStore(), repo)
+      const hasLocalWorktreeGitOptions = Object.keys(localWorktreeGitOptions).length > 0
       const registeredWorktrees = repo.connectionId
         ? await provider!.listWorktrees(repo.path)
-        : await listWorktrees(repo.path)
+        : hasLocalWorktreeGitOptions
+          ? await listWorktrees(repo.path, localWorktreeGitOptions)
+          : await listWorktrees(repo.path)
       const removedMeta = store.getWorktreeMeta(removalTarget.id)
       const removedPushTarget = removedMeta?.pushTarget ?? removalTarget.pushTarget
       const registeredWorktree = findRegisteredDeletableWorktree(
@@ -11978,14 +12501,20 @@ export class OrcaRuntimeService {
               (path) => fsProvider.readFile(path)
             )
           } else {
+            const access = getLocalWorktreePathAccess(localWorktreeGitOptions)
             canCleanOrphanedDirectory = await canSafelyRemoveOrphanedWorktreeDirectory(
-              removalTarget.path,
-              repo.path
+              toLocalWorktreeRuntimePath(removalTarget.path, localWorktreeGitOptions),
+              toLocalWorktreeRuntimePath(repo.path, localWorktreeGitOptions),
+              access.statPath,
+              access.readPath
             )
           }
         }
         if (canCleanOrphanedDirectory) {
-          assertWorktreeDoesNotContainRegisteredWorktree(removalTarget.path, registeredWorktrees)
+          assertWorktreeDoesNotContainRegisteredWorktree(
+            toLocalWorktreeRuntimePath(removalTarget.path, localWorktreeGitOptions),
+            registeredWorktrees
+          )
           if (!force) {
             throw new Error(ORPHANED_WORKTREE_DIRECTORY_MESSAGE)
           }
@@ -11999,7 +12528,7 @@ export class OrcaRuntimeService {
               store
             )
           } else {
-            await rm(removalTarget.path, { recursive: true, force: true })
+            await removeLocalWorktreePath(removalTarget.path, localWorktreeGitOptions)
             await cleanupUnusedWorktreePushTargetRemote(
               repo.path,
               removalTarget.id,
@@ -12015,7 +12544,7 @@ export class OrcaRuntimeService {
           this.notifyWorktreesChanged(repo.id)
           return {}
         }
-        if (await isRuntimeWorktreePathMissing(repo, removalTarget.path)) {
+        if (await isRuntimeWorktreePathMissing(repo, removalTarget.path, localWorktreeGitOptions)) {
           if (!force && !removedMeta) {
             // Why: without persisted metadata, require the renderer recovery
             // path before deleting Orca-only state for an unregistered path.
@@ -12082,7 +12611,13 @@ export class OrcaRuntimeService {
       const hooks = getEffectiveHooks(repo)
       let warning: string | undefined
       if (hooks?.scripts.archive && runHooks) {
-        const result = await runHook('archive', canonicalWorktreePath, repo)
+        const result = await runHook(
+          'archive',
+          canonicalWorktreePath,
+          repo,
+          undefined,
+          this.getLocalGitExecutionOptionArgs(repo)[0]
+        )
         if (!result.success) {
           console.error(`[hooks] archive hook failed for ${canonicalWorktreePath}:`, result.output)
         }
@@ -12093,8 +12628,13 @@ export class OrcaRuntimeService {
       }
 
       let shouldTearDownPtys = true
+      if (repo.symlinkPaths && repo.symlinkPaths.length > 0) {
+        await removeWorktreeLinkedPaths(canonicalWorktreePath, repo.symlinkPaths)
+      }
       try {
-        await assertWorktreeCleanForRemoval(canonicalWorktreePath, force)
+        await (hasLocalWorktreeGitOptions
+          ? assertWorktreeCleanForRemoval(canonicalWorktreePath, force, localWorktreeGitOptions)
+          : assertWorktreeCleanForRemoval(canonicalWorktreePath, force))
       } catch (error) {
         if (!isOrphanCompatiblePreflightError(error)) {
           throw new Error(formatWorktreeRemovalError(error, canonicalWorktreePath, force))
@@ -12137,19 +12677,34 @@ export class OrcaRuntimeService {
 
       let removalResult: RemoveWorktreeResult | undefined
       try {
+        const removeOptions = hasLocalWorktreeGitOptions
+          ? { ...(!deleteBranch ? { deleteBranch } : {}), ...localWorktreeGitOptions }
+          : !deleteBranch
+            ? { deleteBranch }
+            : undefined
         removalResult = this.preserveBranchHeadFallback(
-          await (deleteBranch
-            ? removeWorktree(repo.path, canonicalWorktreePath, force)
-            : removeWorktree(repo.path, canonicalWorktreePath, force, { deleteBranch })),
+          await (removeOptions
+            ? removeWorktree(repo.path, canonicalWorktreePath, force, removeOptions)
+            : removeWorktree(repo.path, canonicalWorktreePath, force)),
           registeredWorktree.head
         )
       } catch (error) {
         if (isOrphanedWorktreeError(error)) {
-          if (await canSafelyRemoveOrphanedWorktreeDirectory(canonicalWorktreePath, repo.path)) {
+          const access = getLocalWorktreePathAccess(localWorktreeGitOptions)
+          if (
+            await canSafelyRemoveOrphanedWorktreeDirectory(
+              toLocalWorktreeRuntimePath(canonicalWorktreePath, localWorktreeGitOptions),
+              toLocalWorktreeRuntimePath(repo.path, localWorktreeGitOptions),
+              access.statPath,
+              access.readPath
+            )
+          ) {
             await closeLocalWatcherForWorktreePath(canonicalWorktreePath).catch((err) => {
               console.warn(`[filesystem-watcher] failed to close ${canonicalWorktreePath}:`, err)
             })
-            await rm(canonicalWorktreePath, { recursive: true, force: true }).catch(() => {})
+            await removeLocalWorktreePath(canonicalWorktreePath, localWorktreeGitOptions).catch(
+              () => {}
+            )
           } else {
             console.warn(
               `[worktrees] Refusing recursive cleanup for unproven worktree directory: ${canonicalWorktreePath}`
@@ -12159,12 +12714,16 @@ export class OrcaRuntimeService {
           // (`.git/worktrees/<name>`) is still intact. Without pruning, `git worktree
           // list` continues to show the stale entry and the branch it had checked out
           // remains locked — other worktrees cannot check it out.
-          await gitExecFileAsync(['worktree', 'prune'], { cwd: repo.path }).catch(() => {})
+          await gitExecFileAsync(
+            ['worktree', 'prune'],
+            getLocalProjectGitExecOptions(this.requireStore(), repo)
+          ).catch(() => {})
           await cleanupUnusedWorktreePushTargetRemote(
             repo.path,
             removalTarget.id,
             removedPushTarget,
-            store
+            store,
+            localWorktreeGitOptions
           )
           this.clearOptimisticReconcileToken(removalTarget.id)
           this.removeWorktreeMetadataAndHistory(store, removalTarget.id)
@@ -12183,7 +12742,8 @@ export class OrcaRuntimeService {
         repo.path,
         removalTarget.id,
         removedPushTarget,
-        store
+        store,
+        localWorktreeGitOptions
       )
       this.rememberPreservedBranchCleanupTarget(
         removalTarget.id,
@@ -12235,6 +12795,7 @@ export class OrcaRuntimeService {
     opts: {
       command?: string
       env?: Record<string, string>
+      startupCommandDelivery?: WorktreeStartupLaunch['startupCommandDelivery']
       telemetry?: WorktreeStartupLaunch['telemetry']
       title?: string
       focus?: boolean
@@ -12312,6 +12873,7 @@ export class OrcaRuntimeService {
         rows: 40,
         cwd: workspace.path,
         command: agentTeamsPlan?.command ?? opts.command,
+        startupCommandDelivery: opts.startupCommandDelivery,
         env,
         envToDelete: agentTeamsPlan?.envToDelete,
         telemetry: opts.telemetry,
@@ -12408,6 +12970,7 @@ export class OrcaRuntimeService {
         requestId,
         worktreeId,
         command: opts.command,
+        startupCommandDelivery: opts.startupCommandDelivery,
         title: opts.title,
         activate: opts.focus === true || opts.activate === true
       })
@@ -12444,6 +13007,7 @@ export class OrcaRuntimeService {
     return await this.createTerminal(`id:${worktree.id}`, {
       command: startup.startup.command,
       env: startup.startup.env,
+      startupCommandDelivery: startup.startup.startupCommandDelivery,
       telemetry: startup.startup.telemetry,
       title: opts.title
     })
@@ -12455,13 +13019,14 @@ export class OrcaRuntimeService {
       afterTabId?: string
       targetGroupId?: string
       command?: string
+      startupCommandDelivery?: WorktreeStartupLaunch['startupCommandDelivery']
       agent?: TuiAgent
       activate?: boolean
     } = {}
   ): Promise<RuntimeMobileSessionCreateTerminalResult> {
     this.assertGraphReady()
-    const worktree = await this.resolveWorktreeSelector(worktreeSelector)
-    const worktreeId = worktree.id
+    const workspace = await this.resolveTerminalWorkspaceLaunchScope(worktreeSelector)
+    const worktreeId = workspace.id
     this.hydrateHeadlessMobileSessionTabsFromWorkspaceSession(worktreeId)
     let afterDesktopTabId: string | undefined
     if (opts.afterTabId) {
@@ -12472,7 +13037,7 @@ export class OrcaRuntimeService {
       }
       afterDesktopTabId = anchor.type === 'terminal' ? anchor.parentTabId : anchor.id
     }
-    const command = await this.resolveMobileSessionTerminalCommand(worktree, opts)
+    const command = await this.resolveMobileSessionTerminalCommand(workspace, opts)
 
     const win = this.getAvailableAuthoritativeWindow()
     if (!win) {
@@ -12481,6 +13046,7 @@ export class OrcaRuntimeService {
         opts.activate !== false,
         opts.afterTabId,
         command,
+        opts.startupCommandDelivery,
         undefined,
         opts.agent
       )
@@ -12514,6 +13080,7 @@ export class OrcaRuntimeService {
         afterTabId: afterDesktopTabId,
         targetGroupId: opts.targetGroupId,
         command,
+        startupCommandDelivery: opts.startupCommandDelivery,
         activate: opts.activate
       })
     })
@@ -12525,7 +13092,7 @@ export class OrcaRuntimeService {
   }
 
   private async resolveMobileSessionTerminalCommand(
-    worktree: Worktree,
+    workspace: TerminalWorkspaceLaunchScope,
     opts: { command?: string; agent?: TuiAgent }
   ): Promise<string | undefined> {
     if (opts.command || !opts.agent) {
@@ -12538,10 +13105,9 @@ export class OrcaRuntimeService {
     if (!isTuiAgentEnabled(opts.agent, settings.disabledTuiAgents)) {
       throw new Error('Selected agent is disabled. Choose an enabled agent before creating.')
     }
-    const repo = this.store.getRepo(worktree.repoId)
     // Why: mobile may be running on iOS while the actual terminal shell is
     // Windows/macOS/Linux or an SSH Linux host; quote for the host shell.
-    const platform = repo ? getAgentLaunchPlatformForRepo(repo) : process.platform
+    const platform = this.getAgentLaunchPlatformForWorkspace(workspace)
     const startupPlan = buildAgentStartupPlan({
       agent: opts.agent,
       prompt: '',
@@ -12554,10 +13120,14 @@ export class OrcaRuntimeService {
     if (!startupPlan) {
       throw new Error(`Could not build launch command for ${opts.agent}.`)
     }
-    if (repo?.connectionId) {
-      await this.markRemoteWorkspaceTrustedForAgent(opts.agent, repo.connectionId, worktree.path)
+    if (workspace.connectionId) {
+      await this.markRemoteWorkspaceTrustedForAgent(
+        opts.agent,
+        workspace.connectionId,
+        workspace.path
+      )
     } else {
-      this.markLocalWorkspaceTrustedForAgent(opts.agent, worktree.path)
+      this.markLocalWorkspaceTrustedForAgent(opts.agent, workspace.path)
     }
     return startupPlan.launchCommand
   }
@@ -12567,18 +13137,19 @@ export class OrcaRuntimeService {
     activate: boolean,
     afterTabId?: string,
     command?: string,
+    startupCommandDelivery?: WorktreeStartupLaunch['startupCommandDelivery'],
     identity?: { tabId: string; leafId: string; sessionId?: string },
     launchAgent?: TuiAgent
   ): Promise<RuntimeMobileSessionCreateTerminalResult> {
-    const worktree = await this.resolveWorktreeSelector(`id:${worktreeId}`)
-    const repo = this.store?.getRepo(worktree.repoId)
+    const workspace = await this.resolveTerminalWorkspaceLaunchScope(`id:${worktreeId}`)
     // Why: SshPtyProvider treats sessionId as a relay reattach request. Only
     // synthesize local serve ids; SSH fresh terminals must call pty.spawn.
     const stableSessionId =
-      identity?.sessionId ?? (repo?.connectionId ? undefined : `serve-${randomUUID()}`)
+      identity?.sessionId ?? (workspace.connectionId ? undefined : `serve-${randomUUID()}`)
     const terminal = await this.createTerminal(`id:${worktreeId}`, {
       focus: false,
       command,
+      startupCommandDelivery,
       ...(identity
         ? {
             tabId: identity.tabId,
@@ -13354,6 +13925,7 @@ export class OrcaRuntimeService {
       id: folderWorkspaceKey(workspace.id),
       path: workspace.folderPath,
       connectionId: this.resolveFolderWorkspaceConnectionId(workspace),
+      repo: null,
       folderWorkspace: workspace
     }
   }
@@ -13375,6 +13947,7 @@ export class OrcaRuntimeService {
       id: worktree.id,
       path: worktree.path,
       connectionId: repo?.connectionId ?? null,
+      repo,
       folderWorkspace: null
     }
   }
@@ -13886,12 +14459,6 @@ export class OrcaRuntimeService {
       throw new Error('selector_ambiguous')
     }
     throw new Error('repo_not_found')
-  }
-
-  private assertHostIntegrationRepoIsLocal(repo: Repo, operation: string): void {
-    if (repo.connectionId) {
-      throw new Error(`${operation}_unsupported_for_ssh_repo`)
-    }
   }
 
   private requireStore(): Store {

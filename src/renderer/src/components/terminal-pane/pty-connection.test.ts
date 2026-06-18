@@ -57,6 +57,13 @@ type StoreState = {
     displayName?: string
     executionHostId?: string | null
   }[]
+  projects: {
+    id: string
+    localWindowsRuntimePreference?:
+      | { kind: 'inherit-global' }
+      | { kind: 'windows-host' }
+      | { kind: 'wsl'; distro: string }
+  }[]
   sshConnectionStates: Map<string, { status: string }>
   cacheTimerByKey: Record<string, number | null>
   settings: {
@@ -64,6 +71,9 @@ type StoreState = {
     promptCacheTimerEnabled?: boolean
     activeRuntimeEnvironmentId?: string | null
     experimentalTerminalAttention?: boolean
+    terminalWindowsShell?: string
+    terminalWindowsWslDistro?: string | null
+    localWindowsRuntimeDefault?: { kind: 'windows-host' } | { kind: 'wsl'; distro: string | null }
     notifications?: {
       enabled?: boolean
       agentTaskComplete?: boolean
@@ -471,6 +481,7 @@ describe('connectPanePty', () => {
         repo1: [{ id: 'wt-1', repoId: 'repo1', path: '/tmp/wt-1', displayName: 'feat/notis' }]
       },
       repos: [{ id: 'repo1', connectionId: null, displayName: 'orca' }],
+      projects: [],
       sshConnectionStates: new Map(),
       cacheTimerByKey: {},
       settings: { promptCacheTimerEnabled: true, experimentalTerminalAttention: true },
@@ -522,6 +533,9 @@ describe('connectPanePty', () => {
           declarePendingPaneSerializer: vi.fn().mockResolvedValue(1),
           settlePaneSerializer: vi.fn().mockResolvedValue(undefined),
           clearPendingPaneSerializer: vi.fn().mockResolvedValue(undefined)
+        },
+        platform: {
+          get: vi.fn(() => ({ platform: 'win32', osRelease: '10.0.26100' }))
         },
         notifications: {
           dispatch: vi.fn().mockResolvedValue({ delivered: true }),
@@ -582,6 +596,36 @@ describe('connectPanePty', () => {
     expect((globalThis as Record<string, unknown>).__ptyConnectDiag).toBeUndefined()
     expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('[pty-connect]'))
     logSpy.mockRestore()
+  })
+
+  it('threads the resolved local project runtime into IPC terminal transport options', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport()
+    transportFactoryQueue.push(transport)
+    mockStoreState = {
+      ...mockStoreState,
+      settings: {
+        ...mockStoreState.settings,
+        terminalWindowsShell: 'wsl.exe',
+        terminalWindowsWslDistro: 'Debian',
+        localWindowsRuntimeDefault: { kind: 'wsl', distro: 'Debian' }
+      },
+      projects: [{ id: 'repo1', localWindowsRuntimePreference: { kind: 'windows-host' } }]
+    }
+
+    connectPanePty(createPane(1) as never, createManager(1) as never, createDeps() as never)
+    await flushAsyncTicks()
+
+    expect(createdTransportOptions[0]?.projectRuntime).toEqual({
+      status: 'resolved',
+      runtime: {
+        kind: 'windows-host',
+        hostPlatform: 'win32',
+        projectId: 'repo1',
+        reason: 'project-override',
+        cacheKey: 'repo1:windows-host'
+      }
+    })
   })
 
   it('observes live terminal GitHub PR URLs before agent completion', async () => {
@@ -2388,7 +2432,7 @@ describe('connectPanePty', () => {
     expect(transport.sendInput).not.toHaveBeenCalled()
   })
 
-  it('sends startup command via sendInput for SSH connections (relay has no shell-ready mechanism)', async () => {
+  it('sends fast startup commands via sendInput for SSH connections', async () => {
     // Capture the setTimeout callback directly so we can fire it without
     // vi.useFakeTimers() (which would also replace the rAF mock from beforeEach).
     const pendingTimeouts: (() => void)[] = []
@@ -2413,7 +2457,8 @@ describe('connectPanePty', () => {
       )
       transportFactoryQueue.push(transport)
 
-      // SSH connection: connectionId is set, relay ignores the command field
+      // SSH connection: connectionId is set, relay receives command metadata
+      // for spawn context but the renderer owns fast command delivery.
       mockStoreState = {
         ...mockStoreState,
         tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
@@ -2436,6 +2481,227 @@ describe('connectPanePty', () => {
       }
 
       expect(transport.sendInput).toHaveBeenCalledWith("claude 'say test'\r")
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
+
+  it('waits for the SSH shell-ready marker before sending hinted startup commands', async () => {
+    const pendingTimeouts: (() => void)[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = vi.fn((fn: () => void) => {
+      pendingTimeouts.push(fn)
+      return 999 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    try {
+      const { connectPanePty } = await import('./pty-connection')
+
+      const capturedDataCallback: { current: ((data: string) => void) | null } = {
+        current: null
+      }
+      const transport = createMockTransport('pty-id')
+      transport.connect.mockImplementation(
+        async ({ callbacks }: { callbacks: ConnectCallbacks }) => {
+          capturedDataCallback.current = callbacks.onData ?? null
+          return 'pty-ssh-1'
+        }
+      )
+      transportFactoryQueue.push(transport)
+
+      mockStoreState = {
+        ...mockStoreState,
+        tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+        repos: [{ id: 'repo1', connectionId: 'ssh-conn-1' }]
+      }
+
+      const pane = createPane(1)
+      const manager = createManager(1)
+      const deps = createDeps({
+        startup: {
+          command: "codex 'linked issue context'",
+          startupCommandDelivery: 'shell-ready'
+        }
+      })
+
+      connectPanePty(pane as never, manager as never, deps as never)
+      expect(capturedDataCallback.current).not.toBeNull()
+
+      capturedDataCallback.current?.('user@remote $ ')
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+      expect(transport.sendInput).not.toHaveBeenCalled()
+
+      capturedDataCallback.current?.('\x1b]777;orca-shell-ready\x07user@remote $ ')
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+
+      expect(transport.sendInput).toHaveBeenCalledWith("codex 'linked issue context'\r")
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
+
+  it('falls back for SSH shell-ready startup commands when no marker arrives', async () => {
+    const pendingTimeouts: (() => void)[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = vi.fn((fn: () => void) => {
+      pendingTimeouts.push(fn)
+      return 999 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    try {
+      const { connectPanePty } = await import('./pty-connection')
+
+      const capturedDataCallback: { current: ((data: string) => void) | null } = {
+        current: null
+      }
+      const transport = createMockTransport('pty-id')
+      transport.connect.mockImplementation(
+        async ({ callbacks }: { callbacks: ConnectCallbacks }) => {
+          capturedDataCallback.current = callbacks.onData ?? null
+          return 'pty-ssh-1'
+        }
+      )
+      transportFactoryQueue.push(transport)
+
+      mockStoreState = {
+        ...mockStoreState,
+        tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+        repos: [{ id: 'repo1', connectionId: 'ssh-conn-1' }]
+      }
+
+      const pane = createPane(1)
+      const manager = createManager(1)
+      const deps = createDeps({
+        startup: {
+          command: "codex 'linked issue context'",
+          startupCommandDelivery: 'shell-ready'
+        }
+      })
+
+      connectPanePty(pane as never, manager as never, deps as never)
+      capturedDataCallback.current?.('fish prompt> ')
+
+      expect(transport.sendInput).not.toHaveBeenCalled()
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+
+      expect(transport.sendInput).toHaveBeenCalledWith("codex 'linked issue context'\r")
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
+
+  it('falls back for quiet SSH shell-ready startup commands with no output', async () => {
+    const pendingTimeouts: (() => void)[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = vi.fn((fn: () => void) => {
+      pendingTimeouts.push(fn)
+      return 999 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    try {
+      const { connectPanePty } = await import('./pty-connection')
+
+      const capturedDataCallback: { current: ((data: string) => void) | null } = {
+        current: null
+      }
+      const transport = createMockTransport('pty-id')
+      transport.connect.mockImplementation(
+        async ({ callbacks }: { callbacks: ConnectCallbacks }) => {
+          capturedDataCallback.current = callbacks.onData ?? null
+          return 'pty-ssh-1'
+        }
+      )
+      transportFactoryQueue.push(transport)
+
+      mockStoreState = {
+        ...mockStoreState,
+        tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+        repos: [{ id: 'repo1', connectionId: 'ssh-conn-1' }]
+      }
+
+      const pane = createPane(1)
+      const manager = createManager(1)
+      const deps = createDeps({
+        startup: {
+          command: "codex 'linked issue context'",
+          startupCommandDelivery: 'shell-ready'
+        }
+      })
+
+      connectPanePty(pane as never, manager as never, deps as never)
+      await flushAsyncTicks()
+      expect(capturedDataCallback.current).not.toBeNull()
+      expect(transport.sendInput).not.toHaveBeenCalled()
+
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+
+      expect(transport.sendInput).toHaveBeenCalledWith("codex 'linked issue context'\r")
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+    }
+  })
+
+  it('waits for shell-ready for SSH Codex native prefill commands without an explicit hint', async () => {
+    const pendingTimeouts: (() => void)[] = []
+    const originalSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = vi.fn((fn: () => void) => {
+      pendingTimeouts.push(fn)
+      return 999 as unknown as ReturnType<typeof setTimeout>
+    }) as unknown as typeof setTimeout
+
+    try {
+      const { connectPanePty } = await import('./pty-connection')
+
+      const capturedDataCallback: { current: ((data: string) => void) | null } = {
+        current: null
+      }
+      const transport = createMockTransport('pty-id')
+      transport.connect.mockImplementation(
+        async ({ callbacks }: { callbacks: ConnectCallbacks }) => {
+          capturedDataCallback.current = callbacks.onData ?? null
+          return 'pty-ssh-1'
+        }
+      )
+      transportFactoryQueue.push(transport)
+      mockStoreState = {
+        ...mockStoreState,
+        tabsByWorktree: { 'wt-1': [{ id: 'tab-1', ptyId: null }] },
+        repos: [{ id: 'repo1', connectionId: 'ssh-conn-1' }]
+      }
+
+      const pane = createPane(1)
+      const manager = createManager(1)
+      const deps = createDeps({
+        startup: { command: "codex --prefill 'linked issue context'" }
+      })
+
+      connectPanePty(pane as never, manager as never, deps as never)
+      capturedDataCallback.current?.('user@remote $ ')
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+      expect(transport.sendInput).not.toHaveBeenCalled()
+
+      capturedDataCallback.current?.('\x1b]777;orca-shell-ready\x07user@remote $ ')
+      for (const fn of pendingTimeouts.splice(0)) {
+        fn()
+      }
+
+      expect(transport.sendInput).toHaveBeenCalledWith("codex --prefill 'linked issue context'\r")
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }
@@ -3100,6 +3366,77 @@ describe('connectPanePty', () => {
     )
     expect(transport.sendInput).toHaveBeenCalledWith(
       "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'\r"
+    )
+  })
+
+  it('uses WSL quoting for cold-restored agent resume in Windows-path WSL projects', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('fresh-pty')
+    transport.connect.mockImplementation(async ({ sessionId }: { sessionId?: string }) => {
+      if (sessionId) {
+        return {
+          id: 'fresh-pty',
+          coldRestore: { scrollback: 'cold-payload', cwd: 'C:\\tmp\\wt-1' }
+        }
+      }
+      return 'fresh-pty'
+    })
+    transportFactoryQueue.push(transport)
+    const paneKey = makePaneKey('tab-1', LEAF_1)
+    mockStoreState = {
+      ...mockStoreState,
+      tabsByWorktree: {
+        'wt-1': [{ id: 'tab-1', ptyId: 'lost-pty' }]
+      },
+      settings: {
+        ...mockStoreState.settings,
+        agentCmdOverrides: {},
+        localWindowsRuntimeDefault: { kind: 'windows-host' }
+      },
+      projects: [
+        {
+          id: 'repo1',
+          localWindowsRuntimePreference: { kind: 'wsl', distro: 'Ubuntu' }
+        }
+      ],
+      worktreesByRepo: {
+        repo1: [
+          {
+            id: 'wt-1',
+            repoId: 'repo1',
+            path: 'C:\\tmp\\wt-1',
+            displayName: 'feat/notis'
+          }
+        ]
+      },
+      agentStatusByPaneKey: {
+        [paneKey]: {
+          state: 'working',
+          prompt: 'finish the task',
+          agentType: 'codex',
+          paneKey,
+          updatedAt: 1,
+          stateStartedAt: 1,
+          stateHistory: [],
+          providerSession: { key: 'session_id', id: "codex-session-1's" }
+        }
+      }
+    } as StoreState
+
+    const pane = createPane(1)
+    const manager = createManager(1)
+    const deps = createDeps({
+      restoredLeafId: LEAF_1,
+      restoredPtyIdByLeafId: { [LEAF_1]: 'lost-pty' }
+    })
+
+    connectPanePty(pane as never, manager as never, deps as never)
+    await flushAsyncTicks(20)
+    await new Promise((resolve) => setTimeout(resolve, 70))
+
+    expect(pane.terminal.write).toHaveBeenCalledWith('cold-payload', expect.any(Function))
+    expect(transport.sendInput).toHaveBeenCalledWith(
+      "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'\\''s'\r"
     )
   })
 
@@ -6513,6 +6850,43 @@ describe('connectPanePty', () => {
         terminalTitle: 'codex',
         paneKey: makePaneKey('tab-1', LEAF_1)
       })
+    )
+  })
+
+  it('resolves synthetic terminal titles for remote hook status updates', async () => {
+    const { connectPanePty } = await import('./pty-connection')
+    const transport = createMockTransport('pty-devin')
+    transportFactoryQueue.push(transport)
+    enableActiveRuntimeEnvironment()
+    mockStoreState.runtimePaneTitlesByTabId = { 'tab-1': { 1: '\u280b Devin' } }
+
+    const pane = createPane(1)
+    const manager = createManager(1)
+    const deps = createDeps()
+
+    connectPanePty(pane as never, manager as never, deps as never)
+
+    const statusHandler = createdTransportOptions[0]?.onAgentStatus as
+      | ((payload: { state: 'done'; prompt: string; agentType: 'devin' }) => void)
+      | undefined
+    if (!statusHandler) {
+      throw new Error('Expected onAgentStatus to be registered')
+    }
+
+    statusHandler({
+      state: 'done',
+      prompt: 'finish the implementation',
+      agentType: 'devin'
+    })
+
+    expect(mockStoreState.setAgentStatus).toHaveBeenCalledWith(
+      makePaneKey('tab-1', LEAF_1),
+      {
+        state: 'done',
+        prompt: 'finish the implementation',
+        agentType: 'devin'
+      },
+      'Devin ready'
     )
   })
 

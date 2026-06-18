@@ -112,6 +112,7 @@ import { initializeBrowserSessionsForApp } from './browser/browser-session-start
 import { setUnreadDockBadgeCount } from './dock/unread-badge'
 import { AutomationService } from './automations/service'
 import { createHeadlessAutomationOutputSnapshotBuffer } from './automations/headless-dispatch'
+import { buildHeadlessAutomationWorktreeCreateArgs } from './automations/headless-workspace-create'
 import { AgentAwakeService } from './agent-awake-service'
 import {
   getCrashBreadcrumbSnapshot,
@@ -143,6 +144,7 @@ import {
 import type { AgentStatusState } from '../shared/agent-status-types'
 import { KeybindingService } from './keybindings/keybinding-service'
 import { applyElectronProxySettings } from './network/proxy-settings'
+import { preserveAgentAuthBeforeRestart } from './agent-auth-restart-preservation'
 
 let mainWindow: BrowserWindow | null = null
 /** Whether a manual app.quit() (Cmd+Q, etc.) is in progress. Shared with the
@@ -162,15 +164,6 @@ let runtime: OrcaRuntimeService | null = null
 let rateLimits: RateLimitService | null = null
 let runtimeRpc: OrcaRuntimeRpcServer | null = null
 
-function buildHeadlessAutomationWorkspaceName(runTitle: string, scheduledFor: number): string {
-  const slug = runTitle
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 40)
-  const stamp = new Date(scheduledFor).toISOString().replace(/[-:]/g, '').slice(0, 13)
-  return `auto-${slug || 'run'}-${stamp}`
-}
 let starNag: StarNagService | null = null
 let agentAwakeService: AgentAwakeService | null = null
 let crashReports: CrashReportStore | null = null
@@ -704,7 +697,7 @@ function openMainWindow(): BrowserWindow {
     automations,
     {
       prepareForCodexLaunch: prepareCodexRuntimeHomeForLaunch,
-      prepareForClaudeLaunch: () => claudeRuntimeAuth!.prepareForClaudeLaunch()
+      prepareForClaudeLaunch: (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target)
     },
     agentAwakeService ?? undefined,
     crashReports ?? undefined,
@@ -712,9 +705,9 @@ function openMainWindow(): BrowserWindow {
     {
       getAdditionalAiVaultCodexHomePaths: () =>
         codexRuntimeHome ? [codexRuntimeHome.getHostRuntimeHomePath()] : [],
-      onBeforeRelaunch: () => {
+      onBeforeRelaunch: async () => {
         isQuitting = true
-        store?.flush()
+        await preserveAgentAuthBeforeRestart({ codexRuntimeHome, claudeRuntimeAuth, store })
       }
     }
   )
@@ -733,7 +726,9 @@ function openMainWindow(): BrowserWindow {
           markExpectedRendererReload(webContentsId)
         }
         recordCrashBreadcrumb('renderer_reload_requested', { ignoreCache })
-      }
+      },
+      onBeforeUpdateQuit: () =>
+        preserveAgentAuthBeforeRestart({ codexRuntimeHome, claudeRuntimeAuth, store })
     }
   )
   rateLimits.attach(window)
@@ -1357,15 +1352,11 @@ app.whenReady().then(async () => {
 
           if (automation.workspaceMode === 'new_per_run') {
             const created = await runtimeService.createManagedWorktree({
-              repoSelector: target.repo.id,
-              name: buildHeadlessAutomationWorkspaceName(run.title, run.scheduledFor),
-              baseBranch: automation.baseBranch ?? undefined,
-              setupDecision: 'inherit',
-              activate: false,
-              createdWithAgent: automation.agentId,
-              startupAgent: automation.agentId,
-              startupPrompt: automation.prompt,
-              telemetrySource: 'unknown'
+              ...buildHeadlessAutomationWorktreeCreateArgs({
+                automation,
+                run,
+                repo: target.repo
+              })
             })
             terminalHandle = created.startupTerminal?.handle ?? ''
             terminalSessionId = created.startupTerminal?.tabId ?? null
@@ -1437,7 +1428,7 @@ app.whenReady().then(async () => {
     // even for the system-default path, so every Orca-launched Codex process
     // must resolve CODEX_HOME through the runtime-home service.
     prepareForCodexLaunch: prepareCodexRuntimeHomeForLaunch,
-    prepareForClaudeLaunch: () => claudeRuntimeAuth!.prepareForClaudeLaunch()
+    prepareForClaudeLaunch: (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target)
   })
   starNag = new StarNagService(store, stats)
   starNag.start()
