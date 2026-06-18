@@ -9,7 +9,19 @@ import {
 } from './terminal-url-link-hit-testing'
 
 type TerminalLinkEvent = Pick<MouseEvent, 'metaKey' | 'ctrlKey'> &
-  Partial<Pick<MouseEvent, 'shiftKey' | 'preventDefault' | 'stopPropagation'>>
+  Partial<Pick<MouseEvent, 'button' | 'shiftKey' | 'preventDefault' | 'stopPropagation'>>
+
+function isPrimaryOscLinkActivation(event: TerminalLinkEvent | undefined): boolean {
+  if (!event) {
+    return false
+  }
+  if ('button' in event && event.button !== undefined && event.button !== 0) {
+    return false
+  }
+  // Why: macOS Ctrl-click is a context-menu gesture even when Chromium reports
+  // it as button 0; ordinary OSC links should not steal that secondary action.
+  return !(navigator.userAgent.includes('Mac') && event.ctrlKey && !event.metaKey)
+}
 
 export function handleOscLink(
   rawText: string,
@@ -19,6 +31,9 @@ export function handleOscLink(
       requestOpenLinksInAppPreference?: TerminalLinkRoutingPreferenceRequester
     }
 ): void {
+  if (!isPrimaryOscLinkActivation(event)) {
+    return
+  }
   // Why: xterm renders OSC 8 links as clickable anchors. Orca must suppress
   // default anchor navigation so link-routing settings can choose the target.
   // Note: we intentionally do NOT stopPropagation here — xterm's

@@ -63,7 +63,7 @@ export const URL_TAP_WEBVIEW_JS = `
       if (!cell) return null;
       var line = term.buffer.active.getLine(cell.row);
       if (!line) return null;
-      var urlId = oscLinkIdNearCell(line, cell.col);
+      var urlId = oscLinkIdAtCell(line, cell.col);
       if (!urlId) return initialOscLinkAtCell(cell.row, cell.col);
       var svc = oscLinkService();
       if (!svc || !svc.getLinkData) return initialOscLinkAtCell(cell.row, cell.col);
@@ -78,26 +78,37 @@ export const URL_TAP_WEBVIEW_JS = `
       if (!link || typeof link.uri !== 'string' || !/^https?:/i.test(link.uri)) continue;
       if (link.row < initialOscLinkRowOffset) continue;
       var shiftedRow = link.row - initialOscLinkRowOffset;
-      if (shiftedRow === row && col >= link.startCol && col < link.endCol) return link.uri;
+      if (shiftedRow === row && col >= link.startCol && col < link.endCol && initialOscLinkTextStillMatches(link, shiftedRow)) return link.uri;
     }
     return null;
+  }
+  function captureInitialOscLinkTexts() {
+    if (!Array.isArray(initialOscLinks)) return;
+    for (var i = 0; i < initialOscLinks.length; i++) {
+      var link = initialOscLinks[i];
+      if (!link || typeof link.text === 'string') continue;
+      link.text = initialOscLinkTextAtRow(link, link.row);
+    }
+  }
+  function initialOscLinkTextStillMatches(link, row) {
+    if (typeof link.text !== 'string') return false;
+    return link.text.length > 0 && initialOscLinkTextAtRow(link, row) === link.text;
+  }
+  function initialOscLinkTextAtRow(link, row) {
+    try {
+      var lineText = getLineText(row);
+      var start = cellColToStringIndex(row, link.startCol);
+      var end = cellColToStringIndex(row, link.endCol);
+      return lineText.slice(start, end);
+    } catch (e) {
+      return '';
+    }
   }
   function oscLinkIdAtCell(line, col) {
     try {
       var bufCell = line.getCell(col);
       return bufCell && bufCell.extended && bufCell.extended.urlId ? bufCell.extended.urlId : 0;
     } catch (e) { return 0; }
-  }
-  function oscLinkIdNearCell(line, col) {
-    var exact = oscLinkIdAtCell(line, col);
-    if (exact) return exact;
-    var max = Math.min(16, Math.max(term && term.cols ? term.cols : 0, line.length || 0));
-    for (var offset = 1; offset <= max; offset++) {
-      var left = col - offset, right = col + offset;
-      var id = left >= 0 ? oscLinkIdAtCell(line, left) : 0; if (id) return id;
-      id = right < line.length ? oscLinkIdAtCell(line, right) : 0; if (id) return id;
-    }
-    return 0;
   }
 
   function notifyTerminalSurfaceTap(originX, originY) {

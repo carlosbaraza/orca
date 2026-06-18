@@ -269,11 +269,17 @@ function readClickPoint(value: unknown, fallback: BrowserClickPoint): BrowserCli
   return { x, y, adjusted: point?.adjusted === true, handled: point?.handled === true }
 }
 
-function mobileTouchClickExpression(x: number, y: number, radius: number): string {
+function mobileTouchClickExpression(
+  x: number,
+  y: number,
+  radius: number,
+  allowDomActivation: boolean
+): string {
   return `(() => {
     const inputX = ${JSON.stringify(x)};
     const inputY = ${JSON.stringify(y)};
     const radius = ${JSON.stringify(radius)};
+    const allowDomActivation = ${JSON.stringify(allowDomActivation)};
     const selector = [
       'a[href]',
       'button',
@@ -364,8 +370,11 @@ function mobileTouchClickExpression(x: number, y: number, radius: number): strin
         break;
       }
     }
-    if (best && dispatchClick(best.target, best.x, best.y)) {
+    if (best && allowDomActivation && dispatchClick(best.target, best.x, best.y)) {
       return { x: best.x, y: best.y, adjusted: true, handled: true };
+    }
+    if (best) {
+      return { x: best.x, y: best.y, adjusted: true, handled: false };
     }
     return { x: inputX, y: inputY, adjusted: false, handled: false };
   })()`
@@ -375,7 +384,8 @@ async function resolveMobileTouchClickPoint(
   dbg: WebContents['debugger'],
   x: number,
   y: number,
-  radius?: number
+  radius: number | undefined,
+  allowDomActivation: boolean
 ): Promise<BrowserClickPoint> {
   const fallback = { x, y, adjusted: false, handled: false }
   if (typeof radius !== 'number' || !Number.isFinite(radius) || radius <= 0) {
@@ -383,7 +393,7 @@ async function resolveMobileTouchClickPoint(
   }
   try {
     const result = await dbg.sendCommand('Runtime.evaluate', {
-      expression: mobileTouchClickExpression(x, y, radius),
+      expression: mobileTouchClickExpression(x, y, radius, allowDomActivation),
       returnByValue: true,
       silent: true
     })
@@ -882,7 +892,9 @@ export class AgentBrowserBridge {
           wc.focus()
           const point =
             cdpButton === 'left'
-              ? await resolveMobileTouchClickPoint(wc.debugger, x, y, radius)
+              ? // Why: DOM activation cannot carry Cmd/Ctrl/Alt/Shift, so modifier
+                // clicks use only the adjusted point and let CDP dispatch the event.
+                await resolveMobileTouchClickPoint(wc.debugger, x, y, radius, cdpModifiers === 0)
               : { x, y, adjusted: false, handled: false }
           // Why: mobile taps should land as one atomic input operation. Sending
           // move/down/up through separate CLI calls visibly hovers targets and can

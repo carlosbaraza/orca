@@ -88,6 +88,7 @@ import {
   type TerminalModes,
   type TerminalWebViewHandle
 } from '../../../../src/terminal/TerminalWebView'
+import { isTerminalOscLinkRanges } from '../../../../src/terminal/terminal-osc-link-ranges'
 import { useTerminalViewportRefit } from '../../../../src/terminal/terminal-viewport-refit'
 import {
   getDefaultTerminalAccessoryBuiltInIds,
@@ -4629,7 +4630,7 @@ export default function SessionScreen() {
                         ]}
                         disabled={!canSend}
                         onPressIn={() => {
-                          if (!key.repeatable || !key.bytes) {
+                          if (!key.repeatable) {
                             return
                           }
                           void handleAccessoryKey(key.bytes)
@@ -4641,7 +4642,7 @@ export default function SessionScreen() {
                           }
                         }}
                         onPress={() => {
-                          if (key.repeatable || !key.bytes) {
+                          if (key.repeatable) {
                             return
                           }
                           void handleAccessoryKey(key.bytes)

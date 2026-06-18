@@ -5,15 +5,12 @@ import { extractLastOscTitle } from '../../shared/agent-detection'
 import { collectHeadlessOscLinkRanges } from './headless-osc-link-ranges'
 import { parseFileUriPath } from './osc7-file-uri'
 import type { TerminalSnapshot, TerminalModes } from './types'
+import type { TerminalOscLinkRange } from '../../shared/terminal-osc-link-ranges'
 
 export type HeadlessEmulatorOptions = {
   cols: number
   rows: number
   scrollback?: number
-}
-
-export type HeadlessSnapshotOptions = {
-  scrollbackRows?: number
 }
 
 type TerminalWithSynchronousWrite = Terminal & {
@@ -39,6 +36,7 @@ export class HeadlessEmulator {
   private mouseTrackingMode: MouseTrackingMode = 'none'
   private sgrMouseMode = false
   private sgrMousePixelsMode = false
+  private restoredOscLinks: TerminalOscLinkRange[] = []
   private disposed = false
 
   constructor(opts: HeadlessEmulatorOptions) {
@@ -123,10 +121,11 @@ export class HeadlessEmulator {
     if (this.disposed) {
       return
     }
+    this.restoredOscLinks = []
     this.terminal.resize(cols, rows)
   }
 
-  getSnapshot(opts: HeadlessSnapshotOptions = {}): TerminalSnapshot {
+  getSnapshot(opts: { scrollbackRows?: number } = {}): TerminalSnapshot {
     const modes = this.getModes()
     const snapshotAnsi = this.normalizeSnapshotAnsiForModes(
       this.serializer.serialize({ scrollback: opts.scrollbackRows }),
@@ -135,7 +134,11 @@ export class HeadlessEmulator {
     return {
       snapshotAnsi,
       scrollbackAnsi: '',
-      oscLinks: collectHeadlessOscLinkRanges(this.terminal, opts.scrollbackRows),
+      oscLinks: collectHeadlessOscLinkRanges(
+        this.terminal,
+        opts.scrollbackRows,
+        this.restoredOscLinks
+      ),
       rehydrateSequences: this.buildRehydrateSequences(modes),
       cwd: this.cwd,
       modes,
@@ -171,7 +174,12 @@ export class HeadlessEmulator {
     this.lastTitle = title
   }
 
+  setRestoredOscLinks(links: TerminalOscLinkRange[] | undefined): void {
+    this.restoredOscLinks = links?.slice() ?? []
+  }
+
   clearScrollback(): void {
+    this.restoredOscLinks = []
     this.terminal.clear()
   }
 

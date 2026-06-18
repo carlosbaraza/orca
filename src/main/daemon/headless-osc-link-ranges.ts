@@ -16,7 +16,8 @@ type CellWithOscLink = {
 
 export function collectHeadlessOscLinkRanges(
   terminal: Terminal,
-  scrollbackRows: number | undefined
+  scrollbackRows: number | undefined,
+  restoredLinks: TerminalOscLinkRange[] = []
 ): TerminalOscLinkRange[] {
   // Why: headless xterm exposes OSC 8 metadata only via this private service.
   // Keep this boundary explicit so xterm upgrades are audited here.
@@ -25,8 +26,8 @@ export function collectHeadlessOscLinkRanges(
     return []
   }
   const buffer = terminal.buffer.active
-  const requestedRows = scrollbackRows ?? 0
-  const startRow = Math.max(0, buffer.length - terminal.rows - requestedRows)
+  const startRow =
+    scrollbackRows === undefined ? 0 : Math.max(0, buffer.length - terminal.rows - scrollbackRows)
   const ranges: TerminalOscLinkRange[] = []
   for (let row = startRow; row < buffer.length; row += 1) {
     const line = buffer.getLine(row)
@@ -51,7 +52,35 @@ export function collectHeadlessOscLinkRanges(
       currentStart = urlId ? col : -1
     }
   }
-  return ranges
+  for (const link of restoredLinks) {
+    if (link.row < startRow || link.row >= buffer.length) {
+      continue
+    }
+    const startCol = Math.max(0, Math.min(terminal.cols, link.startCol))
+    const endCol = Math.max(0, Math.min(terminal.cols, link.endCol))
+    if (startCol >= endCol) {
+      continue
+    }
+    ranges.push({
+      row: link.row - startRow,
+      startCol,
+      endCol,
+      uri: link.uri
+    })
+  }
+  return dedupeOscLinkRanges(ranges)
+}
+
+function dedupeOscLinkRanges(ranges: TerminalOscLinkRange[]): TerminalOscLinkRange[] {
+  const seen = new Set<string>()
+  return ranges.filter((range) => {
+    const key = `${range.row}:${range.startCol}:${range.endCol}:${range.uri}`
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 }
 
 function getOscLinkIdAtCell(line: { getCell: (col: number) => unknown }, col: number): number {

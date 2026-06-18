@@ -410,6 +410,7 @@ async function sendMobileResizeRestream(
     reason: event.reason,
     seq: event.seq ?? serialized.seq,
     source: serialized.source,
+    oscLinks: serialized.oscLinks,
     truncated: false,
     truncatedByByteBudget: serialized.truncatedByByteBudget,
     data: serialized.data

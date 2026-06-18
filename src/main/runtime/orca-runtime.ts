@@ -896,6 +896,7 @@ type RuntimeHeadlessTerminal = {
 
 type HeadlessSeedMetadata = {
   cwd?: string | null
+  oscLinks?: TerminalOscLinkRange[]
 }
 
 type RuntimePtyController = {
@@ -4223,6 +4224,9 @@ export class OrcaRuntimeService {
         await state.emulator.write(data)
         if (metadata.cwd !== undefined) {
           state.emulator.setCwd(metadata.cwd)
+        }
+        if (metadata.oscLinks !== undefined) {
+          state.emulator.setRestoredOscLinks(metadata.oscLinks)
         }
       })
       .catch(() => {

@@ -1,8 +1,7 @@
 export type TerminalAccessoryKey = {
   id: string
   label: string
-  bytes?: string
-  modifier?: 'cmd'
+  bytes: string
   accessibilityLabel?: string
   repeatable?: boolean
 }
@@ -237,7 +236,6 @@ export const TERMINAL_ACCESSORY_KEYS: TerminalAccessoryKey[] = [
     accessibilityLabel: 'Arrow Right',
     repeatable: true
   },
-  { id: 'cmd', label: 'Cmd', modifier: 'cmd', accessibilityLabel: 'Command modifier' },
   { id: 'ctrlC', label: 'Ctrl+C', bytes: '\x03', accessibilityLabel: 'Interrupt terminal' },
   { id: 'ctrlD', label: 'Ctrl+D', bytes: '\x04', accessibilityLabel: 'Send EOF' },
   { id: 'ctrlL', label: 'Ctrl+L', bytes: '\x0c', accessibilityLabel: 'Clear screen' },

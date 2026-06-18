@@ -3,19 +3,6 @@ import { describe, expect, it } from 'vitest'
 import { buildTerminalShortcutKey, TERMINAL_ACCESSORY_KEYS } from './terminal-accessory-keys'
 
 describe('TERMINAL_ACCESSORY_KEYS', () => {
-  it('includes a non-byte Command modifier key after Arrow Right', () => {
-    const ids = TERMINAL_ACCESSORY_KEYS.map((key) => key.id)
-    const cmdIndex = ids.indexOf('cmd')
-
-    expect(cmdIndex).toBe(ids.indexOf('arrowRight') + 1)
-    expect(TERMINAL_ACCESSORY_KEYS[cmdIndex]).toEqual({
-      id: 'cmd',
-      label: 'Cmd',
-      modifier: 'cmd',
-      accessibilityLabel: 'Command modifier'
-    })
-  })
-
   it('sends reverse-tab with a non-repeatable Shift+Tab key', () => {
     const key = TERMINAL_ACCESSORY_KEYS.find((candidate) => candidate.id === 'shiftTab')
 
@@ -56,6 +43,10 @@ describe('TERMINAL_ACCESSORY_KEYS', () => {
 
     expect(ids.every((id) => id.length > 0)).toBe(true)
     expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('keeps all built-in terminal keys byte-backed', () => {
+    expect(TERMINAL_ACCESSORY_KEYS.every((key) => key.bytes.length > 0)).toBe(true)
   })
 
   it('keeps repeat behavior explicit for built-in terminal keys', () => {
