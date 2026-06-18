@@ -13,6 +13,8 @@ export type AiVaultScanOptions = {
   copilotSessionsDir?: string
   cursorProjectsDir?: string
   opencodeStorageDir?: string
+  grokSessionsDir?: string
+  devinTranscriptsDir?: string
   hermesSessionsDir?: string
   rovoSessionsDir?: string
   openclawStateDir?: string

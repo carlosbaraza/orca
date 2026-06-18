@@ -27,7 +27,10 @@ import type { DetectedAgentsSlice } from './slices/detected-agents'
 import type { WorktreeNavHistorySlice } from './slices/worktree-nav-history'
 import type { DictationSlice } from './slices/dictation'
 import type { WorkspaceCleanupSlice } from './slices/workspace-cleanup'
+import type { RuntimeStatusSlice } from './slices/runtime-status'
 import type { PullRequestGenerationSlice } from './slices/pull-request-generation'
+import type { CommitMessageGenerationSlice } from './slices/commit-message-generation'
+import type { PinnedTabCloseConfirmSlice } from './slices/pinned-tab-close-confirm'
 
 export type AppState = RepoSlice &
   SparsePresetsSlice &
@@ -58,4 +61,7 @@ export type AppState = RepoSlice &
   WorktreeNavHistorySlice &
   DictationSlice &
   WorkspaceCleanupSlice &
-  PullRequestGenerationSlice
+  RuntimeStatusSlice &
+  PullRequestGenerationSlice &
+  CommitMessageGenerationSlice &
+  PinnedTabCloseConfirmSlice

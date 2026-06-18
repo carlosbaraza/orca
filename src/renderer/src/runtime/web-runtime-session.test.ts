@@ -150,7 +150,8 @@ describe('createWebRuntimeSessionBrowserTab', () => {
     )
     expect(mocks.createBrowserTab).toHaveBeenCalledWith(WORKTREE_ID, 'https://example.com/', {
       title: 'https://example.com/',
-      focusAddressBar: true
+      focusAddressBar: true,
+      browserRuntimeEnvironmentId: ENVIRONMENT_ID
     })
     expect(mocks.setRemoteBrowserPageHandle).toHaveBeenCalledWith('local-page-1', {
       environmentId: ENVIRONMENT_ID,
@@ -419,7 +420,8 @@ describe('createWebRuntimeSessionTerminal', () => {
         worktreeId: WORKTREE_ID,
         afterTabId: 'web-terminal-host-tab-1%3A%3Aleaf-1',
         targetGroupId: 'group-left',
-        command: 'zsh',
+        command: "codex 'linked issue context'",
+        startupCommandDelivery: 'shell-ready',
         activate: true
       })
     ).resolves.toBe(true)
@@ -431,7 +433,8 @@ describe('createWebRuntimeSessionTerminal', () => {
         worktree: `id:${WORKTREE_ID}`,
         afterTabId: 'host-tab-1::leaf-1',
         targetGroupId: 'group-left',
-        command: 'zsh',
+        command: "codex 'linked issue context'",
+        startupCommandDelivery: 'shell-ready',
         activate: true
       },
       timeoutMs: 15_000

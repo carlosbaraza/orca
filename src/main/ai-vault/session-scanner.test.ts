@@ -20,6 +20,8 @@ function isolatedScanRoots(root: string) {
     copilotSessionsDir: join(root, 'copilot-sessions'),
     cursorProjectsDir: join(root, 'cursor-projects'),
     opencodeStorageDir: join(root, 'opencode-storage'),
+    grokSessionsDir: join(root, 'grok-sessions'),
+    devinTranscriptsDir: join(root, 'devin-transcripts'),
     hermesSessionsDir: join(root, 'hermes-sessions'),
     rovoSessionsDir: join(root, 'rovo-sessions'),
     openclawStateDir: join(root, 'openclaw-state'),
@@ -422,6 +424,42 @@ describe('scanAiVaultSessions', () => {
       })
     )
 
+    await mkdir(join(roots.grokSessionsDir, encodeURIComponent('/tmp/grok'), 'grok-session'), {
+      recursive: true
+    })
+    await writeFile(
+      join(roots.grokSessionsDir, encodeURIComponent('/tmp/grok'), 'grok-session', 'summary.json'),
+      JSON.stringify({
+        info: { id: 'grok-session', cwd: '/tmp/grok' },
+        session_summary: '',
+        created_at: '2026-05-01T10:04:00.000Z',
+        updated_at: '2026-05-01T10:04:01.000Z',
+        num_chat_messages: 2,
+        current_model_id: 'grok-build',
+        head_branch: 'feature/grok-vault'
+      })
+    )
+    await writeFile(
+      join(
+        roots.grokSessionsDir,
+        encodeURIComponent('/tmp/grok'),
+        'grok-session',
+        'chat_history.jsonl'
+      ),
+      jsonLines([
+        {
+          type: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '<user_info>context</user_info><user_query>Grok title</user_query>'
+            }
+          ]
+        },
+        { type: 'assistant', content: 'Done' }
+      ])
+    )
+
     await mkdir(roots.hermesSessionsDir, { recursive: true })
     await writeFile(
       join(roots.hermesSessionsDir, 'session_hermes-session.json'),
@@ -489,6 +527,26 @@ describe('scanAiVaultSessions', () => {
       ])
     )
 
+    await mkdir(roots.devinTranscriptsDir, { recursive: true })
+    await writeFile(
+      join(roots.devinTranscriptsDir, 'devin-session.json'),
+      JSON.stringify({
+        session_id: 'devin-session',
+        working_directory: '/tmp/devin',
+        agent: { model_name: 'swe-1-6-fast' },
+        steps: [
+          {
+            metadata: {
+              created_at: '2026-05-01T10:10:00.000Z',
+              is_user_input: true,
+              metrics: { input_tokens: 1, output_tokens: 2 }
+            },
+            text: 'Devin vault title'
+          }
+        ]
+      })
+    )
+
     await mkdir(roots.droidSessionsDir, { recursive: true })
     await writeFile(
       join(roots.droidSessionsDir, 'droid-session.jsonl'),
@@ -544,6 +602,7 @@ describe('scanAiVaultSessions', () => {
     expect(commandByAgent.get('opencode')).toBe(
       "cd '/tmp/opencode' && opencode --session 'opencode-session'"
     )
+    expect(commandByAgent.get('grok')).toBe("cd '/tmp/grok' && grok --resume 'grok-session'")
     expect(commandByAgent.get('hermes')).toBe(
       "cd '/tmp/hermes' && hermes --resume 'hermes-session'"
     )
@@ -554,6 +613,7 @@ describe('scanAiVaultSessions', () => {
       "cd '/tmp/openclaw' && openclaw --resume 'openclaw-session'"
     )
     expect(commandByAgent.get('pi')).toBe("cd '/tmp/pi' && pi --session 'pi-session'")
+    expect(commandByAgent.get('devin')).toBe("cd '/tmp/devin' && devin --resume 'devin-session'")
     expect(commandByAgent.get('droid')).toBe("cd '/tmp/droid' && droid --resume 'droid-session'")
   })
 })

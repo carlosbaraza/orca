@@ -120,6 +120,24 @@ describe('createEditorSlice right sidebar state', () => {
     expect(store.getState().rightSidebarTabByWorktree).toEqual({})
   })
 
+  it('increments the right sidebar route request id for explicit route actions', () => {
+    const store = createEditorStore()
+
+    expect(store.getState().rightSidebarRouteRequestId).toBe(0)
+
+    store.getState().setRightSidebarTab('checks')
+    expect(store.getState().rightSidebarRouteRequestId).toBe(1)
+
+    store.getState().setRightSidebarExplorerView('files')
+    expect(store.getState().rightSidebarRouteRequestId).toBe(2)
+
+    store.getState().showRightSidebarFiles()
+    expect(store.getState().rightSidebarRouteRequestId).toBe(3)
+
+    store.getState().showRightSidebarSearch()
+    expect(store.getState().rightSidebarRouteRequestId).toBe(4)
+  })
+
   it('setRightSidebarTab with no active worktree does not mutate the worktree map', () => {
     const store = createEditorStore()
     const remembered = { 'wt-1': 'checks' as const }
@@ -224,6 +242,7 @@ describe('createEditorSlice right sidebar state', () => {
     expect(store.getState().rightSidebarOpen).toBe(true)
     expect(store.getState().rightSidebarTab).toBe('explorer')
     expect(store.getState().rightSidebarExplorerView).toBe('files')
+    expect(store.getState().rightSidebarRouteRequestId).toBe(1)
     expect(store.getState().rightSidebarExplorerViewByWorktree).toEqual({ 'wt-2': 'files' })
     expect(store.getState().rightSidebarTabByWorktree).toBe(remembered)
     expect(store.getState().pendingExplorerReveal).toMatchObject({
@@ -452,6 +471,62 @@ describe('createEditorSlice openDiff', () => {
 
     store.getState().openDiff('wt-1', '/repo/file.ts', 'file.ts', 'typescript', false)
     expect(store.getState().openFiles[0]?.diffContentReloadNonce).toBe(2)
+  })
+
+  it('bumps fileContentReloadNonce when re-opening an existing clean file with reload requested', () => {
+    const store = createEditorStore()
+
+    const openFileWithReloadRequest = (): void =>
+      store.getState().openFile(
+        {
+          filePath: '/repo/file.ts',
+          relativePath: 'file.ts',
+          worktreeId: 'wt-1',
+          language: 'typescript',
+          mode: 'edit'
+        },
+        { forceContentReload: true }
+      )
+
+    openFileWithReloadRequest()
+    expect(store.getState().openFiles[0]?.fileContentReloadNonce).toBeUndefined()
+
+    openFileWithReloadRequest()
+    expect(store.getState().openFiles[0]?.fileContentReloadNonce).toBe(1)
+
+    openFileWithReloadRequest()
+    expect(store.getState().openFiles[0]?.fileContentReloadNonce).toBe(2)
+  })
+
+  it('does not bump fileContentReloadNonce when a dirty file is re-opened', () => {
+    const store = createEditorStore()
+
+    store.getState().openFile({
+      filePath: '/repo/file.ts',
+      relativePath: 'file.ts',
+      worktreeId: 'wt-1',
+      language: 'typescript',
+      mode: 'edit'
+    })
+    store.getState().markFileDirty('/repo/file.ts', true)
+
+    store.getState().openFile(
+      {
+        filePath: '/repo/file.ts',
+        relativePath: 'file.ts',
+        worktreeId: 'wt-1',
+        language: 'typescript',
+        mode: 'edit'
+      },
+      { forceContentReload: true }
+    )
+
+    expect(store.getState().openFiles[0]).toEqual(
+      expect.objectContaining({
+        isDirty: true,
+        fileContentReloadNonce: undefined
+      })
+    )
   })
 
   it('opens the visible diff tab in the requested split group', () => {
@@ -1148,6 +1223,78 @@ describe('createEditorSlice untitled cleanup routing', () => {
   })
 })
 
+describe('createEditorSlice recently closed editor tabs', () => {
+  function openMirroredEditor(store: StoreApi<AppState>, filePath: string, preview = false): void {
+    store.getState().openFile(
+      {
+        filePath,
+        relativePath: filePath.replace('/repo/', ''),
+        worktreeId: 'wt-1',
+        language: 'markdown',
+        runtimeEnvironmentId: 'env-1',
+        mirroredFromRuntimeSession: true,
+        mode: 'edit'
+      },
+      { preview }
+    )
+  }
+
+  it('reopens a closed mirrored editor tab as a local tab', () => {
+    const store = createEditorStore()
+    openMirroredEditor(store, '/repo/notes.md')
+
+    store.getState().closeFile('/repo/notes.md')
+
+    const recent = store.getState().recentlyClosedEditorTabsByWorktree['wt-1']?.[0]
+    expect(recent).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(recent).not.toHaveProperty('mirroredFromRuntimeSession')
+
+    expect(store.getState().reopenClosedEditorTab('wt-1')).toBe(true)
+    expect(store.getState().openFiles[0]).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(store.getState().openFiles[0]).not.toHaveProperty('mirroredFromRuntimeSession')
+  })
+
+  it('reopens close-all mirrored editor tabs as local tabs', () => {
+    const store = createEditorStore()
+    openMirroredEditor(store, '/repo/notes.md')
+
+    store.getState().closeAllFiles()
+
+    const recent = store.getState().recentlyClosedEditorTabsByWorktree['wt-1']?.[0]
+    expect(recent).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(recent).not.toHaveProperty('mirroredFromRuntimeSession')
+
+    expect(store.getState().reopenClosedEditorTab('wt-1')).toBe(true)
+    expect(store.getState().openFiles[0]).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(store.getState().openFiles[0]).not.toHaveProperty('mirroredFromRuntimeSession')
+  })
+
+  it('reopens replaced mirrored preview tabs as local tabs', () => {
+    const store = createEditorStore()
+    openMirroredEditor(store, '/repo/notes.md', true)
+
+    store.getState().openFile(
+      {
+        filePath: '/repo/guide.md',
+        relativePath: 'guide.md',
+        worktreeId: 'wt-1',
+        language: 'markdown',
+        runtimeEnvironmentId: 'env-1',
+        mode: 'edit'
+      },
+      { preview: true, recordReplacedPreview: true }
+    )
+
+    const recent = store.getState().recentlyClosedEditorTabsByWorktree['wt-1']?.[0]
+    expect(recent).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(recent).not.toHaveProperty('mirroredFromRuntimeSession')
+
+    expect(store.getState().reopenClosedEditorTab('wt-1')).toBe(true)
+    expect(store.getState().openFiles.at(-1)).toMatchObject({ filePath: '/repo/notes.md' })
+    expect(store.getState().openFiles.at(-1)).not.toHaveProperty('mirroredFromRuntimeSession')
+  })
+})
+
 describe('createEditorSlice markdown view state', () => {
   it('updates stale language metadata when reopening an existing file', () => {
     const store = createEditorStore()
@@ -1839,6 +1986,166 @@ describe('createEditorSlice conflict status reconciliation', () => {
     ])
   })
 
+  it('reloads an open check-details tab from the hosted provider', async () => {
+    const fetchPRCheckDetails = vi.fn().mockResolvedValue({
+      name: 'verify',
+      status: 'completed',
+      conclusion: 'success',
+      url: null,
+      detailsUrl: null,
+      startedAt: null,
+      completedAt: null,
+      title: 'Build passed',
+      summary: null,
+      text: null,
+      annotations: [],
+      jobs: []
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const store = createStore<any>()((...args: any[]) => ({
+      activeWorktreeId: 'wt-1',
+      repos: [{ id: 'repo-1', path: '/repo' }],
+      worktreesByRepo: { 'repo-1': [{ id: 'wt-1', repoId: 'repo-1', path: '/repo' }] },
+      fetchPRCheckDetails,
+      ...createEditorSlice(...(args as Parameters<typeof createEditorSlice>))
+    })) as unknown as StoreApi<AppState>
+    const check = {
+      name: 'verify',
+      status: 'completed' as const,
+      conclusion: 'failure' as const,
+      url: null,
+      checkRunId: 42
+    }
+
+    store.getState().openCheckRunDetails('wt-1', 'repo:99', check, {
+      details: null,
+      loading: false,
+      error: null
+    })
+
+    await store.getState().reloadOpenCheckRunDetailsTab('wt-1::check-details::check-run:42')
+
+    expect(fetchPRCheckDetails).toHaveBeenCalledWith(
+      '/repo',
+      expect.objectContaining({ checkRunId: 42, checkName: 'verify' }),
+      { repoId: 'repo-1' }
+    )
+    expect(store.getState().openFiles).toContainEqual(
+      expect.objectContaining({
+        id: 'wt-1::check-details::check-run:42',
+        checkRunDetails: expect.objectContaining({
+          loading: false,
+          details: expect.objectContaining({ title: 'Build passed', conclusion: 'success' })
+        })
+      })
+    )
+  })
+
+  it('patches an open check-details tab without changing the active file', () => {
+    const store = createEditorTabsStore()
+    const check = {
+      name: 'verify',
+      status: 'completed' as const,
+      conclusion: 'failure' as const,
+      url: null,
+      checkRunId: 42
+    }
+
+    store.getState().openCheckRunDetails('wt-1', 'repo:99', check, {
+      details: null,
+      loading: true,
+      error: null
+    })
+    store.getState().openFile({
+      filePath: '/repo/other.ts',
+      relativePath: 'other.ts',
+      worktreeId: 'wt-1',
+      language: 'typescript',
+      mode: 'edit'
+    })
+
+    store.getState().patchOpenCheckRunDetails('wt-1', 'repo:99', check, {
+      details: {
+        name: 'verify',
+        status: 'completed',
+        conclusion: 'failure',
+        url: null,
+        detailsUrl: null,
+        startedAt: null,
+        completedAt: null,
+        title: 'Build failed',
+        summary: null,
+        text: null,
+        annotations: [],
+        jobs: []
+      },
+      loading: false,
+      error: null
+    })
+
+    expect(store.getState().activeFileId).toBe('/repo/other.ts')
+    expect(store.getState().openFiles).toContainEqual(
+      expect.objectContaining({
+        id: 'wt-1::check-details::check-run:42',
+        checkRunDetails: expect.objectContaining({
+          loading: false,
+          details: expect.objectContaining({ title: 'Build failed' })
+        })
+      })
+    )
+  })
+
+  it('opens check full details as a center-pane editor tab', () => {
+    const store = createEditorTabsStore()
+    const check = {
+      name: 'verify',
+      status: 'completed' as const,
+      conclusion: 'failure' as const,
+      url: null,
+      checkRunId: 42
+    }
+
+    store.getState().openCheckRunDetails('wt-1', 'repo:99', check, {
+      details: {
+        name: 'verify',
+        status: 'completed',
+        conclusion: 'failure',
+        url: null,
+        detailsUrl: null,
+        startedAt: null,
+        completedAt: null,
+        title: 'Build failed',
+        summary: null,
+        text: null,
+        annotations: [],
+        jobs: []
+      },
+      loading: false,
+      error: null
+    })
+
+    expect(store.getState().activeFileId).toBe('wt-1::check-details::check-run:42')
+    expect(store.getState().openFiles).toContainEqual(
+      expect.objectContaining({
+        id: 'wt-1::check-details::check-run:42',
+        mode: 'check-details',
+        relativePath: 'verify',
+        checkRunDetails: expect.objectContaining({
+          contextKey: 'repo:99',
+          check,
+          details: expect.objectContaining({ title: 'Build failed' })
+        })
+      })
+    )
+    expect(store.getState().unifiedTabsByWorktree['wt-1']).toContainEqual(
+      expect.objectContaining({
+        entityId: 'wt-1::check-details::check-run:42',
+        contentType: 'check-details',
+        label: 'verify'
+      })
+    )
+  })
+
   it('keeps the conflict review active when selecting a conflict from its tree', () => {
     const store = createEditorStore()
 
@@ -2096,6 +2403,28 @@ describe('createEditorSlice remote branch actions', () => {
       connectionId: undefined
     })
     expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('routes git operations through the explicit runtime owner instead of ambient focus', async () => {
+    const store = createEditorStore()
+    store.setState({ settings: { activeRuntimeEnvironmentId: 'focused-runtime' } as never })
+
+    await store.getState().pushBranch('wt-1', '/repo', false, undefined, undefined, {
+      runtimeTargetSettings: { activeRuntimeEnvironmentId: null }
+    })
+
+    expect(gitPushMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      publish: false,
+      connectionId: undefined,
+      pushTarget: undefined,
+      forceWithLease: undefined
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined,
+      pushTarget: undefined
+    })
   })
 
   it('runs rebase from base and refreshes upstream on success', async () => {
@@ -2407,6 +2736,64 @@ describe('createEditorSlice remote branch actions', () => {
     await flushAsyncRemoteRefresh()
 
     expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitFetchMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('surfaces submodule push failures with the submodule name', async () => {
+    const store = createEditorStore()
+    const pushError = new Error(
+      "Command failed: git push\nPushing submodule 'find-cmux-followers'\n" +
+        ' ! [rejected]        master -> master (fetch first)\n' +
+        "Unable to push submodule 'find-cmux-followers'\n" +
+        'fatal: failed to push all needed submodules'
+    )
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toThrow(
+      pushError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "Push failed. Submodule 'find-cmux-followers' has remote changes. Pull inside the submodule, then try again."
+    )
+    await flushAsyncRemoteRefresh()
+
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitFetchMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(gitUpstreamStatusMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('surfaces transport-prefixed normalized submodule push failures', async () => {
+    const store = createEditorStore()
+    const pushError = new Error(
+      "Error invoking remote method 'git:push': Error: Submodule 'find-cmux-followers' has remote changes. Pull inside the submodule, then try again."
+    )
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toThrow(
+      pushError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "Push failed. Submodule 'find-cmux-followers' has remote changes. Pull inside the submodule, then try again."
+    )
+    await flushAsyncRemoteRefresh()
+
     expect(gitFetchMock).toHaveBeenCalledWith({
       worktreePath: '/repo',
       connectionId: undefined
