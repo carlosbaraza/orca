@@ -29,7 +29,7 @@ type UpdaterHandlerContext = {
   hasNewerDownloadedVersion: () => boolean
   evaluateCooldownGate: (version: string) => { eligible: boolean; eligibleAt: number | null }
   markMissingManifestPrereleaseFallbackChecking: () => void
-  performQuitAndInstall: () => void
+  performQuitAndInstall: () => void | Promise<void>
   recordCompletedUpdateCheck: () => void
   sendCheckFailureStatus: (
     message: string,

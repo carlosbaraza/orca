@@ -9,6 +9,7 @@ import { HistoryManager } from './history-manager'
 import { HistoryReader } from './history-reader'
 import { mintPtySessionId, parsePtySessionId } from './pty-session-id'
 import { supportsPtyStartupBarrier } from './shell-ready'
+import { CODEX_SHELL_READY_TIMEOUT_MS } from './session'
 import {
   PROTOCOL_VERSION,
   type CreateOrAttachResult,
@@ -20,6 +21,8 @@ import {
 } from './types'
 import type { IPtyProvider, PtySpawnOptions, PtySpawnResult } from '../providers/types'
 import { isShellProcess } from '../../shared/agent-detection'
+import { recognizeAgentProcessFromCommandLine } from '../../shared/agent-process-recognition'
+import { shouldUseShellReadyStartupDelivery } from '../../shared/codex-startup-delivery'
 
 export type DaemonPtyAdapterOptions = {
   socketPath: string
@@ -133,6 +136,20 @@ export class DaemonPtyAdapter implements IPtyProvider {
 
     await this.ensureConnected()
 
+    const shellReadySupported = opts.command ? supportsPtyStartupBarrier(opts.env ?? {}) : false
+    const isCodexStartupCommand =
+      recognizeAgentProcessFromCommandLine(opts.command)?.agent === 'codex'
+    const shouldWaitForShellReady =
+      isCodexStartupCommand &&
+      shouldUseShellReadyStartupDelivery({
+        command: opts.command,
+        startupCommandDelivery: opts.startupCommandDelivery
+      })
+    const shellReadyTimeoutMs =
+      shellReadySupported && isCodexStartupCommand && !shouldWaitForShellReady
+        ? CODEX_SHELL_READY_TIMEOUT_MS
+        : undefined
+
     const result = await this.client.request<CreateOrAttachResult>('createOrAttach', {
       sessionId,
       cols: effectiveCols,
@@ -141,6 +158,7 @@ export class DaemonPtyAdapter implements IPtyProvider {
       env: opts.env,
       envToDelete: opts.envToDelete,
       command: opts.command,
+      startupCommandDelivery: opts.startupCommandDelivery,
       // Why: without this, the daemon always spawns cmd.exe (COMSPEC) or
       // PowerShell as a fallback — regardless of which shell the renderer
       // asked for in the "+" menu or persisted as the default. Forwarding
@@ -149,7 +167,8 @@ export class DaemonPtyAdapter implements IPtyProvider {
       shellOverride: opts.shellOverride,
       terminalWindowsWslDistro: opts.terminalWindowsWslDistro,
       terminalWindowsPowerShellImplementation: opts.terminalWindowsPowerShellImplementation,
-      shellReadySupported: opts.command ? supportsPtyStartupBarrier(opts.env ?? {}) : false
+      shellReadySupported,
+      ...(shellReadyTimeoutMs !== undefined ? { shellReadyTimeoutMs } : {})
     })
 
     if (effectiveCwd) {
@@ -268,7 +287,12 @@ export class DaemonPtyAdapter implements IPtyProvider {
   }
 
   async shutdown(id: string, opts: { immediate?: boolean; keepHistory?: boolean }): Promise<void> {
-    await this.client.request('kill', { sessionId: id })
+    // Why: sleep/exact-stop must preserve restorable terminal history,
+    // so force a final checkpoint before killing the daemon session.
+    if (opts.keepHistory) {
+      await this.checkpointSessions([id], { final: true })
+    }
+    await this.client.request('kill', { sessionId: id, immediate: opts.immediate ?? false })
     this.activeSessionIds.delete(id)
     this.dirtySessionVersions.delete(id)
     this.coldRestoreCache.delete(id)
@@ -367,7 +391,15 @@ export class DaemonPtyAdapter implements IPtyProvider {
   }
 
   /** Called on app launch. Lists daemon sessions, kills orphans whose
-   *  workspaceId no longer exists, and caches alive session IDs. */
+   *  workspaceId no longer exists, and caches alive session IDs.
+   *
+   *  IMPORTANT: a session id embeds the worktree id it was minted under, which is
+   *  the worktree's *path* at spawn time. When a worktree folder is renamed, its
+   *  id changes but live sessions keep the old id. Callers MUST therefore seed
+   *  `validWorktreeIds` with each live worktree's `WorktreeMeta.priorWorktreeIds`
+   *  (the pre-rename aliases) or those sessions will be reaped as false orphans.
+   *  This reconcile has no production caller yet; wire the alias in when it gains
+   *  one. */
   async reconcileOnStartup(validWorktreeIds: Set<string>): Promise<{
     alive: string[]
     killed: string[]
