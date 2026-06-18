@@ -192,14 +192,17 @@ export const XTERM_HTML = `<!DOCTYPE html>
     <button id="sel-menu-all">Select All</button>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/lib/xterm.min.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.10.0-beta.285/lib/addon-unicode11.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.20.0-beta.285/lib/addon-webgl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.1.0-beta.285/lib/xterm.min.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.10.0-beta.285/lib/addon-unicode11.js"></script><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.20.0-beta.284/lib/addon-webgl.js"></script>
 <script>
 (function() {
   var surface = document.getElementById('terminal-surface');
   var ESC = String.fromCharCode(27);
   var C1_CSI = String.fromCharCode(155);
-  var CLAUDE_STATUS_DOT = String.fromCharCode(0x23fa), TEXT_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0e);
-  var CLAUDE_STATUS_DOT_PATTERN = new RegExp(CLAUDE_STATUS_DOT + String.fromCharCode(0xfe0f) + '?', 'g');
+  var CLAUDE_STATUS_DOT = String.fromCharCode(0x23fa);
+  var TEXT_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0e);
+  var EMOJI_PRESENTATION_SELECTOR = String.fromCharCode(0xfe0f);
+  var CLAUDE_STATUS_DOT_PATTERN = new RegExp(CLAUDE_STATUS_DOT + '[' + TEXT_PRESENTATION_SELECTOR + EMOJI_PRESENTATION_SELECTOR + ']*', 'g');
+  var statusDotPendingSelector = false;
   var PRIVATE_MODE_SCAN_TAIL_LIMIT = 4096;
   var term = null;
   var scrollIndicator = document.getElementById('scroll-indicator');
@@ -554,8 +557,33 @@ export const XTERM_HTML = `<!DOCTYPE html>
     writeQueueHead = 0;
   }
 
+  function isStatusDotPresentationSelector(value) {
+    return value === TEXT_PRESENTATION_SELECTOR || value === EMOJI_PRESENTATION_SELECTOR;
+  }
+
+  function endsWithStatusDotPresentationSequence(data) {
+    var i = data.length - 1;
+    while (i >= 0 && isStatusDotPresentationSelector(data.charAt(i))) i--;
+    return i >= 0 && data.charAt(i) === CLAUDE_STATUS_DOT;
+  }
+
   // Why: iOS WebKit promotes Claude's record/status dot to a colorful emoji glyph.
-  function normalizeStatusDotPresentation(data) { return typeof data === 'string' && data.length > 0 ? data.replace(CLAUDE_STATUS_DOT_PATTERN, CLAUDE_STATUS_DOT + TEXT_PRESENTATION_SELECTOR) : data; }
+  function normalizeStatusDotPresentation(data) {
+    if (typeof data !== 'string' || data.length === 0) return data;
+    if (statusDotPendingSelector) {
+      statusDotPendingSelector = false;
+      var strippedPendingSelectors = false;
+      while (data.length > 0 && isStatusDotPresentationSelector(data.charAt(0))) data = data.slice(1);
+      strippedPendingSelectors = data.length === 0;
+      if (strippedPendingSelectors) {
+        statusDotPendingSelector = true;
+        return '';
+      }
+    }
+    var normalized = data.replace(CLAUDE_STATUS_DOT_PATTERN, CLAUDE_STATUS_DOT + TEXT_PRESENTATION_SELECTOR);
+    statusDotPendingSelector = endsWithStatusDotPresentationSequence(data);
+    return normalized;
+  }
 
   function enqueueWrite(data) {
     writeQueue.push(normalizeStatusDotPresentation(data));
@@ -637,6 +665,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     var gen = terminalGeneration;
     ready = false;
     resetWriteQueue();
+    statusDotPendingSelector = false;
     writesDraining = false;
     afterDrainCallbacks = [];
     initRows = rows || 24;
@@ -844,6 +873,7 @@ export const XTERM_HTML = `<!DOCTYPE html>
     } else if (msg.type === 'clear') {
       terminalGeneration++;
       resetWriteQueue();
+      statusDotPendingSelector = false;
       afterDrainCallbacks = [];
       writesDraining = false;
       mouseModeScanTail = '';
