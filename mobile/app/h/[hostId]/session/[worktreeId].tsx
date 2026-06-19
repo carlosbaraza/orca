@@ -204,13 +204,19 @@ const CLIPBOARD_IMAGE_DATA_URL_PREFIX_RE = /^data:image\/[a-z0-9.+-]+;base64,/i
 const resizeMobileClipboardImage: MobileClipboardImageResizer = async (source, target) => {
   const base64 = source.replace(CLIPBOARD_IMAGE_DATA_URL_PREFIX_RE, '')
   const file = new FsFile(Paths.cache, `orca-clip-resize-${Date.now()}.png`)
+  let context: ReturnType<typeof ImageManipulator.manipulate> | null = null
+  let rendered: Awaited<
+    ReturnType<ReturnType<typeof ImageManipulator.manipulate>['renderAsync']>
+  > | null = null
+  let resultUri: string | null = null
   try {
     file.create({ overwrite: true })
     file.write(base64, { encoding: 'base64' })
-    const context = ImageManipulator.manipulate(file.uri)
-    context.resize({ width: target.width })
-    const rendered = await context.renderAsync()
+    context = ImageManipulator.manipulate(file.uri)
+    context.resize({ width: target.width, height: target.height })
+    rendered = await context.renderAsync()
     const result = await rendered.saveAsync({ format: SaveFormat.PNG, base64: true })
+    resultUri = result.uri
     // Why: empty base64 would pass the downstream base64 check and upload a corrupt
     // image, so fail loudly here instead of silently sending an invalid payload.
     if (!result.base64) {
@@ -218,6 +224,15 @@ const resizeMobileClipboardImage: MobileClipboardImageResizer = async (source, t
     }
     return { data: result.base64, width: result.width, height: result.height }
   } finally {
+    rendered?.release()
+    context?.release()
+    if (resultUri) {
+      try {
+        new FsFile(resultUri).delete()
+      } catch {
+        // Best-effort cleanup; ImageManipulator saves into cache for every retry.
+      }
+    }
     try {
       file.delete()
     } catch {

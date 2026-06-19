@@ -176,6 +176,7 @@ describe('mobile clipboard image downscaling', () => {
     ).resolves.toBe('c'.repeat(40))
     expect(resize).toHaveBeenCalledTimes(2)
     expect(resize.mock.calls[1][0]).toBe('b'.repeat(150))
+    expect(resize.mock.calls[1][1]).toEqual({ width: 11, height: 5 })
   })
 
   it('gives up after bounded attempts and lets the downstream cap reject it', async () => {
