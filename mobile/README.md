@@ -79,6 +79,44 @@ If the phone has a stale host entry, remove it from the app and pair again.
 1. Install Xcode from the App Store
 2. Run `pnpm start --ios` to open in iOS Simulator
 
+### Release build on a physical iPhone
+
+A Release build bakes the JavaScript bundle into the app, so the phone runs without Metro. Mobile JavaScript changes need a new build. Release builds use the native shell (`EXPO_PUBLIC_MOBILE_SHELL` defaults to `native`), so the mobile web bundle the desktop serves does not reach them.
+
+You need full Xcode, CocoaPods, an Apple ID signed in to Xcode (Settings > Accounts), and the iPhone connected with Developer Mode on (Settings > Privacy & Security > Developer Mode).
+
+1. Generate the native project. `ios/` is gitignored.
+
+   ```bash
+   cd mobile
+   pnpm install
+   npx expo prebuild --platform ios --no-install
+   cd ios && pod install
+   ```
+
+2. Sign with your own team. `com.stably.orca.mobile` belongs to Stably's team, so choose a bundle id your team can register. Set `PRODUCT_BUNDLE_IDENTIFIER` and `DEVELOPMENT_TEAM` for the `Orca` target, either in Xcode under Signing & Capabilities or in `ios/Orca.xcodeproj/project.pbxproj`. `defaults read com.apple.dt.Xcode IDEProvisioningTeamByIdentifier` lists your team ids.
+3. Empty `ios/Orca/Orca.entitlements` to `<dict/>`. `app.config.js` always adds `aps-environment`, a free personal team cannot sign it, and push only works with Stably's bundle id.
+4. Build, sign, install and launch. `xcrun xctrace list devices` prints the UDID, and `xcrun devicectl list devices` prints the devicectl id.
+
+   ```bash
+   cd mobile/ios
+   xcodebuild -workspace Orca.xcworkspace -scheme Orca -configuration Release \
+     -destination 'id=<iPhone UDID>' -derivedDataPath build \
+     -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
+     CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM=<team id>
+   xcrun devicectl device install app --device <devicectl id> build/Build/Products/Release-iphoneos/Orca.app
+   xcrun devicectl device process launch --device <devicectl id> <bundle id>
+   ```
+
+The first build compiles React Native from source and takes 20 to 40 minutes. To rebuild, run step 4 again. Do not run `expo prebuild --clean`, because it regenerates `ios/` and undoes steps 2 and 3. A free personal team's profile expires after 7 days, and the first launch needs Settings > General > VPN & Device Management > Trust. A paid team's profile lasts a year.
+
+When the build fails:
+
+- "No Accounts": sign in to Xcode under Settings > Accounts.
+- "PLA Update available": the team's Account Holder must accept the latest Program License Agreement at developer.apple.com/account.
+- "Developer Mode disabled": turn it on in the phone's Settings > Privacy & Security and let it restart.
+- A Simulator build reports "Unable to find a device matching the provided destination specifier": pass `-destination 'id=<simulator id>'` from `xcrun simctl list devices available`, because matching by name picks the newest iOS runtime. Simulator builds need no signing (`-sdk iphonesimulator CODE_SIGNING_ALLOWED=NO`).
+
 ## Physical Phone Debugging
 
 The phone can be inspected through the connected device tooling:
